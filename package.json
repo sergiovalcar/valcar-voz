@@ -1,0 +1,14 @@
+{
+  "name": "valcar-voz-spike",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Spike de infra (Fase 2 voz): testa se o WebRTC/ICE (UDP) chega ao contêiner do Railway. DataChannel echo via werift.",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.18.0",
+    "werift": "^0.23.0"
+  }
+}
