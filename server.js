@@ -113,11 +113,11 @@ app.get("/operador", (_req, res) => res.type("html").send(PAGINA_OPERADOR));
 // chamada recebida (encaminhada pelo Conversas no evento connect)
 app.post("/chamada", async (req, res) => {
   if ((req.headers["x-voz-secret"] || "") !== (process.env.VOZ_SECRET || "")) return res.status(403).json({ erro: "secret" });
-  const { call_id, from, nome, conversa_id, departamento_id, operador_id, mensagem_ocupado, phone_number_id, sdp } = req.body || {};
+  const { call_id, from, nome, conversa_id, departamento_id, operador_id, mensagem_ocupado, mensagem_gravacao, phone_number_id, sdp } = req.body || {};
   res.json({ ok: true });
   if (!call_id || !sdp) { console.error("[voz] /chamada sem call_id/sdp"); return; }
   const phoneId = phone_number_id || process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const c = { call_id, from, nome: nome || from, conversa_id, departamento_id, operador_id: operador_id || null, mensagemOcupado: mensagem_ocupado || null, phoneId, offerSdp: sdp, estado: "tocando", metaPc: null, operatorPc: null, operadorWs: null, iniciada: 0, timer: null };
+  const c = { call_id, from, nome: nome || from, conversa_id, departamento_id, operador_id: operador_id || null, mensagemOcupado: mensagem_ocupado || null, mensagemGravacao: mensagem_gravacao || null, phoneId, offerSdp: sdp, estado: "tocando", metaPc: null, operatorPc: null, operadorWs: null, iniciada: 0, timer: null };
   chamadas.set(call_id, c);
 
   // roteamento (em ordem):
@@ -230,6 +230,8 @@ async function atender(ws, call_id, browserOffer) {
   c.estado = "atendida"; c.operadorWs = ws; c.operadorId = ws._info?.operador_id || null;
   ws._emChamada = call_id; // ocupado: não recebe toque de novas ligações
   clearTimeout(c.timer);
+  // aviso de gravação ao cliente (LGPD) — a gravação em si é feita no navegador do operador
+  if (c.mensagemGravacao && c.from) metaMessages(c.phoneId, c.from, c.mensagemGravacao).catch(() => {});
   avisarOperadores(ws, { tipo: "chamada_assumida", call_id });
   console.log(`[voz] chamada ${call_id} atendida por "${ws._info?.nome}"`);
 
