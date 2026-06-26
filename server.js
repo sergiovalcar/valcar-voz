@@ -30,6 +30,10 @@ import { RTCPeerConnection } from "werift";
 
 const PORT = process.env.PORT || 8080;
 
+// blindagem: no spike, um erro solto não deve derrubar o contêiner
+process.on("uncaughtException", (e) => console.error("[voz] uncaughtException:", e?.message || e));
+process.on("unhandledRejection", (e) => console.error("[voz] unhandledRejection:", e?.message || e));
+
 function iceServers() {
   const lista = [{ urls: process.env.STUN_URL || "stun:stun.l.google.com:19302" }];
   if (process.env.TURN_URL) {
@@ -75,9 +79,14 @@ wss.on("connection", (ws) => {
         // eco do DataChannel: tudo que chega volta com prefixo "eco:"
         pc.onDataChannel.subscribe((canal) => {
           avisar(ws, "datachannel", canal.label);
-          canal.message.subscribe((data) => {
-            const txt = typeof data === "string" ? data : data?.toString?.() || "";
-            try { canal.send("eco:" + txt); } catch (e) { console.error("erro no eco", e); }
+          // werift expõe o evento como onMessage (não "message")
+          const ev = canal.onMessage || canal.message;
+          if (!ev || !ev.subscribe) { avisar(ws, "erro_servidor", "evento de mensagem do datachannel não encontrado"); return; }
+          ev.subscribe((data) => {
+            try {
+              const txt = typeof data === "string" ? data : data?.toString?.() || "";
+              canal.send("eco:" + txt);
+            } catch (e) { console.error("erro no eco", e); }
           });
         });
 
@@ -160,11 +169,20 @@ async function iniciar(){
       if(pc.connectionState==="failed") estado("Não conectou (provável bloqueio de UDP). Precisaremos de TURN.", "falha");
     };
 
+    let ecos = 0, pingTimer = null;
     const canal = pc.createDataChannel("probe");
-    canal.onopen = ()=>{ log("DataChannel aberto — enviando ping…"); canal.send("ping"); };
+    canal.onopen = ()=>{
+      log("DataChannel aberto — enviando ping a cada 2s…");
+      canal.send("ping 0");
+      let n = 0;
+      pingTimer = setInterval(()=>{ try{ canal.send("ping " + (++n)); }catch(e){} }, 2000);
+    };
+    canal.onclose = ()=>{ if(pingTimer) clearInterval(pingTimer); };
     canal.onmessage = (ev)=>{
+      ecos++;
+      window._conectouOk = true;
       log("Recebido do servidor: " + ev.data);
-      estado("✅ Conectou! Caminho de mídia OK (eco recebido).", "ok");
+      estado("✅ Conectou e está estável! Ecos recebidos: " + ecos + " (UDP/ICE OK, sem TURN).", "ok");
       E("btn").disabled = false;
     };
 
@@ -188,7 +206,7 @@ async function iniciar(){
   };
 
   setTimeout(()=>{
-    if(window._pc && window._pc.connectionState!=="connected"){
+    if(!window._conectouOk){
       estado("Não conectou em 12s — provável bloqueio de UDP. Próximo passo: TURN.", "falha");
       E("btn").disabled = false;
     }
