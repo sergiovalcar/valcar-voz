@@ -46,6 +46,19 @@ async function metaCalls(phoneId, body) {
   } catch (e) { return { ok: false, status: 0, json: { erro: e?.message } }; }
 }
 
+// envia mensagem de texto no WhatsApp (usado no "ocupado")
+async function metaMessages(phoneId, to, texto) {
+  try {
+    const r = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${phoneId}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ messaging_product: "whatsapp", to, type: "text", text: { body: texto } }),
+    });
+    const j = await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, json: j };
+  } catch (e) { return { ok: false, status: 0, json: { erro: e?.message } }; }
+}
+
 // ---- estado ----
 const operadores = new Set(); // ws (cada um com ws._info = {nome, departamentos:[], operador_id})
 const chamadas = new Map();    // call_id -> { estado, offerSdp, phoneId, metaPc, operatorPc, operadorWs, ... }
@@ -53,6 +66,10 @@ const chamadas = new Map();    // call_id -> { estado, offerSdp, phoneId, metaPc
 function disponivel(ws) { return ws.readyState === 1 && ws._info && !ws._emChamada; }
 function operadoresDoDepto(deptId) {
   return [...operadores].filter((ws) => disponivel(ws) && (!deptId || ws._info.departamentos.includes(deptId)));
+}
+// online no depto, INCLUINDO ocupados (p/ distinguir "todos ocupados" de "ninguém online")
+function onlineDoDepto(deptId) {
+  return [...operadores].filter((ws) => ws.readyState === 1 && ws._info && (!deptId || ws._info.departamentos.includes(deptId)));
 }
 function avisarOperadores(filtroWsExcluir, payload) {
   for (const op of operadores) if (op !== filtroWsExcluir && op.readyState === 1) { try { op.send(JSON.stringify(payload)); } catch {} }
@@ -66,27 +83,50 @@ app.get("/", (_req, res) => res.redirect("/operador"));
 app.get("/operador", (_req, res) => res.type("html").send(PAGINA_OPERADOR));
 
 // chamada recebida (encaminhada pelo Conversas no evento connect)
-app.post("/chamada", (req, res) => {
+app.post("/chamada", async (req, res) => {
   if ((req.headers["x-voz-secret"] || "") !== (process.env.VOZ_SECRET || "")) return res.status(403).json({ erro: "secret" });
-  const { call_id, from, nome, conversa_id, departamento_id, operador_id, phone_number_id, sdp } = req.body || {};
+  const { call_id, from, nome, conversa_id, departamento_id, operador_id, mensagem_ocupado, phone_number_id, sdp } = req.body || {};
   res.json({ ok: true });
   if (!call_id || !sdp) { console.error("[voz] /chamada sem call_id/sdp"); return; }
   const phoneId = phone_number_id || process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const c = { call_id, from, nome: nome || from, conversa_id, departamento_id, operador_id: operador_id || null, phoneId, offerSdp: sdp, estado: "tocando", metaPc: null, operatorPc: null, operadorWs: null, iniciada: 0, timer: null };
+  const c = { call_id, from, nome: nome || from, conversa_id, departamento_id, operador_id: operador_id || null, mensagemOcupado: mensagem_ocupado || null, phoneId, offerSdp: sdp, estado: "tocando", metaPc: null, operatorPc: null, operadorWs: null, iniciada: 0, timer: null };
   chamadas.set(call_id, c);
 
-  // roteamento:
-  //  (3) operador atribuído na conversa -> toca SÓ pra ele (se estiver online)
-  //  (2) senão, departamento da conversa  (1) que pode ser o padrão -> toca pro depto
-  let alvo, modo;
+  // roteamento (em ordem):
+  //  (3) operador atribuído: online+livre -> só ele | online+ocupado -> OCUPADO | offline -> cai pro depto
+  //  (2)/(1) departamento (o da conversa ou o padrão): livres -> toca | todos ocupados -> OCUPADO | ninguém online -> perdida
+  let alvo = [], modo = "", ocupado = false;
   if (operador_id) {
-    alvo = [...operadores].filter((ws) => disponivel(ws) && ws._info.operador_id === operador_id);
-    modo = `operador atribuído ${operador_id}`;
-    if (alvo.length === 0) { alvo = operadoresDoDepto(departamento_id); modo += " (indisponível -> departamento)"; }
+    const online = [...operadores].filter((ws) => ws.readyState === 1 && ws._info && ws._info.operador_id === operador_id);
+    if (online.length) {
+      const livres = online.filter(disponivel);
+      if (livres.length) { alvo = livres; modo = "operador atribuído"; }
+      else { ocupado = true; modo = "operador atribuído OCUPADO"; }
+    } else {
+      const livresDepto = operadoresDoDepto(departamento_id);
+      if (livresDepto.length) { alvo = livresDepto; modo = "atribuído offline -> departamento"; }
+      else if (onlineDoDepto(departamento_id).length) { ocupado = true; modo = "atribuído offline; departamento OCUPADO"; }
+      else { modo = "atribuído offline; ninguém no departamento"; }
+    }
   } else {
-    alvo = operadoresDoDepto(departamento_id);
-    modo = `departamento ${departamento_id || "—"}`;
+    const livresDepto = operadoresDoDepto(departamento_id);
+    if (livresDepto.length) { alvo = livresDepto; modo = `departamento ${departamento_id || "—"}`; }
+    else if (onlineDoDepto(departamento_id).length) { ocupado = true; modo = "departamento OCUPADO"; }
+    else { modo = "departamento sem ninguém online"; }
   }
+
+  if (ocupado) {
+    c.estado = "encerrada";
+    console.log(`[voz] chamada ${call_id} de ${c.nome}: OCUPADO [${modo}] -> encerra + avisa`);
+    metaCalls(phoneId, { messaging_product: "whatsapp", call_id, action: "terminate" }).catch(() => {});
+    if (c.mensagemOcupado && from) {
+      const r = await metaMessages(phoneId, from, c.mensagemOcupado);
+      console.log(`[voz] msg ocupado p/ ${from}:`, r.status, r.ok ? "" : JSON.stringify(r.json));
+    }
+    chamadas.delete(call_id);
+    return;
+  }
+
   c.tocandoPara = new Set(alvo);
   console.log(`[voz] chamada ${call_id} de ${c.nome}: tocando p/ ${alvo.length} operador(es) [${modo}]`);
   for (const op of alvo) { try { op.send(JSON.stringify({ tipo: "chamada_recebida", call_id, from, nome: c.nome, conversa_id, departamento_id })); } catch {} }
