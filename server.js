@@ -30,8 +30,88 @@ function iceServers() {
 const FORCE_RELAY = process.env.FORCE_RELAY === "1";
 
 const app = express();
+app.use(express.json({ limit: "1mb" }));
+const GRAPH_VERSION = process.env.GRAPH_VERSION || "v21.0";
+const chamadasMeta = new Map(); // call_id -> RTCPeerConnection (perna da Meta)
+
+// chama o endpoint /calls da Graph API (pre_accept / accept / terminate)
+async function metaCalls(phoneId, body) {
+  try {
+    const r = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${phoneId}/calls`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, json: j };
+  } catch (e) {
+    return { ok: false, status: 0, json: { erro: e?.message } };
+  }
+}
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/", (_req, res) => res.type("html").send(PAGINA));
+
+// ------------------------------------------------------------
+// PERNA DA META (Fase 2, teste isolado): recebe a oferta SDP encaminhada
+// pelo Conversas, monta a conexão WebRTC com a Meta, aceita a chamada
+// (pre_accept -> accept) e ECOA o áudio do cliente de volta (o cliente
+// ouve a própria voz). Valida o handshake + o áudio da perna da Meta.
+// ------------------------------------------------------------
+app.post("/chamada", async (req, res) => {
+  if ((req.headers["x-voz-secret"] || "") !== (process.env.VOZ_SECRET || "")) {
+    return res.status(403).json({ erro: "secret inválido" });
+  }
+  const { call_id, sdp, phone_number_id } = req.body || {};
+  res.json({ ok: true }); // responde rápido; o accept acontece em seguida
+  if (!call_id || !sdp) { console.error("[voz][meta] /chamada sem call_id/sdp"); return; }
+  const phoneId = phone_number_id || process.env.WHATSAPP_PHONE_NUMBER_ID;
+  console.log(`[voz][meta ${call_id}] chamada recebida; montando WebRTC…`);
+
+  try {
+    const config = { iceServers: iceServers() };
+    if (FORCE_RELAY) config.iceTransportPolicy = "relay";
+    const pc = new RTCPeerConnection(config);
+    chamadasMeta.set(call_id, pc);
+
+    pc.iceConnectionStateChange.subscribe((s) => console.log(`[voz][meta ${call_id}] ice:`, s));
+    pc.connectionStateChange.subscribe((s) => {
+      console.log(`[voz][meta ${call_id}] pc:`, s);
+      if (s === "closed" || s === "failed" || s === "disconnected") { try { pc.close?.(); } catch {} chamadasMeta.delete(call_id); }
+    });
+
+    // eco: o áudio do cliente volta pra ele mesmo
+    const echoTrack = new MediaStreamTrack({ kind: "audio" });
+    pc.addTransceiver(echoTrack, { direction: "sendrecv" });
+    pc.onTrack.subscribe((track) => {
+      const t = track?.onReceiveRtp ? track : track?.track;
+      if (!t?.onReceiveRtp) return;
+      let n = 0;
+      t.onReceiveRtp.subscribe((rtp) => {
+        n++;
+        if (n === 1) console.log(`[voz][meta ${call_id}] áudio do cliente fluindo (RTP recebido)`);
+        try { echoTrack.writeRtp(rtp); } catch (e) { if (n < 3) console.error("writeRtp:", e?.message); }
+      });
+    });
+
+    await pc.setRemoteDescription({ type: "offer", sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    // a Meta exige a=setup:active no SDP de resposta do negócio
+    const answerSdp = pc.localDescription.sdp
+      .replace(/a=setup:actpass/g, "a=setup:active")
+      .replace(/a=setup:passive/g, "a=setup:active");
+
+    // ordem obrigatória: pre_accept ANTES de accept
+    const sess = { sdp_type: "answer", sdp: answerSdp };
+    const pre = await metaCalls(phoneId, { messaging_product: "whatsapp", call_id, action: "pre_accept", session: sess });
+    console.log(`[voz][meta ${call_id}] pre_accept:`, pre.status, JSON.stringify(pre.json));
+    const acc = await metaCalls(phoneId, { messaging_product: "whatsapp", call_id, action: "accept", session: sess });
+    console.log(`[voz][meta ${call_id}] accept:`, acc.status, JSON.stringify(acc.json));
+  } catch (e) {
+    console.error(`[voz][meta ${call_id}] erro:`, e?.message || e);
+  }
+});
 
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer });
