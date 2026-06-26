@@ -50,8 +50,9 @@ async function metaCalls(phoneId, body) {
 const operadores = new Set(); // ws (cada um com ws._info = {nome, departamentos:[], operador_id})
 const chamadas = new Map();    // call_id -> { estado, offerSdp, phoneId, metaPc, operatorPc, operadorWs, ... }
 
+function disponivel(ws) { return ws.readyState === 1 && ws._info && !ws._emChamada; }
 function operadoresDoDepto(deptId) {
-  return [...operadores].filter((ws) => ws.readyState === 1 && ws._info && (!deptId || ws._info.departamentos.includes(deptId)));
+  return [...operadores].filter((ws) => disponivel(ws) && (!deptId || ws._info.departamentos.includes(deptId)));
 }
 function avisarOperadores(filtroWsExcluir, payload) {
   for (const op of operadores) if (op !== filtroWsExcluir && op.readyState === 1) { try { op.send(JSON.stringify(payload)); } catch {} }
@@ -79,13 +80,14 @@ app.post("/chamada", (req, res) => {
   //  (2) senão, departamento da conversa  (1) que pode ser o padrão -> toca pro depto
   let alvo, modo;
   if (operador_id) {
-    alvo = [...operadores].filter((ws) => ws.readyState === 1 && ws._info && ws._info.operador_id === operador_id);
+    alvo = [...operadores].filter((ws) => disponivel(ws) && ws._info.operador_id === operador_id);
     modo = `operador atribuído ${operador_id}`;
-    if (alvo.length === 0) { alvo = operadoresDoDepto(departamento_id); modo += " (offline -> departamento)"; }
+    if (alvo.length === 0) { alvo = operadoresDoDepto(departamento_id); modo += " (indisponível -> departamento)"; }
   } else {
     alvo = operadoresDoDepto(departamento_id);
     modo = `departamento ${departamento_id || "—"}`;
   }
+  c.tocandoPara = new Set(alvo);
   console.log(`[voz] chamada ${call_id} de ${c.nome}: tocando p/ ${alvo.length} operador(es) [${modo}]`);
   for (const op of alvo) { try { op.send(JSON.stringify({ tipo: "chamada_recebida", call_id, from, nome: c.nome, conversa_id, departamento_id })); } catch {} }
   // 30s sem atender -> perdida (encerra e some da UI)
@@ -108,6 +110,7 @@ app.post("/chamada-fim", (req, res) => {
   if (!c || c.estado === "encerrada") { chamadas.delete(call_id); return; }
   const tocando = c.estado === "tocando";
   c.estado = "encerrada";
+  if (c.operadorWs) c.operadorWs._emChamada = null; // libera o operador
   try { c.metaPc?.close?.(); } catch {}
   try { c.operatorPc?.close?.(); } catch {}
   if (c.operadorWs?.readyState === 1) try { c.operadorWs.send(JSON.stringify({ tipo: "encerrada", call_id, motivo: "cliente" })); } catch {}
@@ -134,7 +137,7 @@ wss.on("connection", (ws) => {
     }
     if (m.tipo === "atender") return atender(ws, m.call_id, m.sdp);
     if (m.tipo === "desligar") return desligar(m.call_id, "operador");
-    // "recusar": só esconde local no operador; a chamada segue tocando p/ os demais
+    if (m.tipo === "recusar") return recusar(ws, m.call_id);
   });
 
   ws.on("close", () => {
@@ -147,6 +150,7 @@ async function atender(ws, call_id, browserOffer) {
   const c = chamadas.get(call_id);
   if (!c || c.estado !== "tocando") { try { ws.send(JSON.stringify({ tipo: "chamada_indisponivel", call_id })); } catch {} return; }
   c.estado = "atendida"; c.operadorWs = ws; c.operadorId = ws._info?.operador_id || null;
+  ws._emChamada = call_id; // ocupado: não recebe toque de novas ligações
   clearTimeout(c.timer);
   avisarOperadores(ws, { tipo: "chamada_assumida", call_id });
   console.log(`[voz] chamada ${call_id} atendida por "${ws._info?.nome}"`);
@@ -196,6 +200,7 @@ function desligar(call_id, motivo) {
   const c = chamadas.get(call_id);
   if (!c || c.estado === "encerrada") { chamadas.delete(call_id); return; }
   c.estado = "encerrada";
+  if (c.operadorWs) c.operadorWs._emChamada = null; // libera o operador
   metaCalls(c.phoneId, { messaging_product: "whatsapp", call_id, action: "terminate" }).catch(() => {});
   try { c.metaPc?.close?.(); } catch {}
   try { c.operatorPc?.close?.(); } catch {}
@@ -204,6 +209,22 @@ function desligar(call_id, motivo) {
   chamadas.delete(call_id);
   const dur = c.iniciada ? Math.round((Date.now() - c.iniciada) / 1000) : 0;
   console.log(`[voz] chamada ${call_id} desligada (${motivo}); duração ${dur}s`);
+}
+
+// operador recusou: tira ele da lista de quem está tocando. Se não sobrar
+// ninguém tocando, encerra a chamada na Meta (o cliente para de ouvir o toque).
+function recusar(ws, call_id) {
+  const c = chamadas.get(call_id);
+  if (!c || c.estado !== "tocando") return;
+  c.tocandoPara?.delete(ws);
+  console.log(`[voz] chamada ${call_id} recusada por "${ws._info?.nome}"; restam ${c.tocandoPara?.size || 0}`);
+  if (!c.tocandoPara || c.tocandoPara.size === 0) {
+    c.estado = "encerrada";
+    metaCalls(c.phoneId, { messaging_product: "whatsapp", call_id, action: "terminate" }).catch(() => {});
+    clearTimeout(c.timer);
+    chamadas.delete(call_id);
+    console.log(`[voz] chamada ${call_id} recusada por todos -> encerrada`);
+  }
 }
 
 httpServer.listen(PORT, () => {
