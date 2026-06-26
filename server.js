@@ -67,14 +67,26 @@ app.get("/operador", (_req, res) => res.type("html").send(PAGINA_OPERADOR));
 // chamada recebida (encaminhada pelo Conversas no evento connect)
 app.post("/chamada", (req, res) => {
   if ((req.headers["x-voz-secret"] || "") !== (process.env.VOZ_SECRET || "")) return res.status(403).json({ erro: "secret" });
-  const { call_id, from, nome, conversa_id, departamento_id, phone_number_id, sdp } = req.body || {};
+  const { call_id, from, nome, conversa_id, departamento_id, operador_id, phone_number_id, sdp } = req.body || {};
   res.json({ ok: true });
   if (!call_id || !sdp) { console.error("[voz] /chamada sem call_id/sdp"); return; }
   const phoneId = phone_number_id || process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const c = { call_id, from, nome: nome || from, conversa_id, departamento_id, phoneId, offerSdp: sdp, estado: "tocando", metaPc: null, operatorPc: null, operadorWs: null, iniciada: 0, timer: null };
+  const c = { call_id, from, nome: nome || from, conversa_id, departamento_id, operador_id: operador_id || null, phoneId, offerSdp: sdp, estado: "tocando", metaPc: null, operatorPc: null, operadorWs: null, iniciada: 0, timer: null };
   chamadas.set(call_id, c);
-  const alvo = operadoresDoDepto(departamento_id);
-  console.log(`[voz] chamada ${call_id} de ${c.nome}: tocando p/ ${alvo.length} operador(es) do depto ${departamento_id || "—"}`);
+
+  // roteamento:
+  //  (3) operador atribuído na conversa -> toca SÓ pra ele (se estiver online)
+  //  (2) senão, departamento da conversa  (1) que pode ser o padrão -> toca pro depto
+  let alvo, modo;
+  if (operador_id) {
+    alvo = [...operadores].filter((ws) => ws.readyState === 1 && ws._info && ws._info.operador_id === operador_id);
+    modo = `operador atribuído ${operador_id}`;
+    if (alvo.length === 0) { alvo = operadoresDoDepto(departamento_id); modo += " (offline -> departamento)"; }
+  } else {
+    alvo = operadoresDoDepto(departamento_id);
+    modo = `departamento ${departamento_id || "—"}`;
+  }
+  console.log(`[voz] chamada ${call_id} de ${c.nome}: tocando p/ ${alvo.length} operador(es) [${modo}]`);
   for (const op of alvo) { try { op.send(JSON.stringify({ tipo: "chamada_recebida", call_id, from, nome: c.nome, conversa_id, departamento_id })); } catch {} }
   // 30s sem atender -> perdida (encerra e some da UI)
   c.timer = setTimeout(() => {
