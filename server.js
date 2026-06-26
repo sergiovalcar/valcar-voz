@@ -18,6 +18,7 @@
 import express from "express";
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
+import crypto from "crypto";
 import { RTCPeerConnection, MediaStreamTrack } from "werift";
 
 const PORT = process.env.PORT || 8080;
@@ -57,6 +58,33 @@ async function metaMessages(phoneId, to, texto) {
     const j = await r.json().catch(() => ({}));
     return { ok: r.ok, status: r.status, json: j };
   } catch (e) { return { ok: false, status: 0, json: { erro: e?.message } }; }
+}
+
+// valida o ticket assinado pelo Conversas (HMAC com VOZ_SECRET) -> dados do operador
+function verificarTicketVoz(ticket) {
+  try {
+    const [corpo, sig] = String(ticket || "").split(".");
+    if (!corpo || !sig) return null;
+    const esperado = crypto.createHmac("sha256", process.env.VOZ_SECRET || "x").update(corpo).digest("hex");
+    if (sig !== esperado) return null;
+    const p = JSON.parse(Buffer.from(corpo, "base64url").toString("utf8"));
+    if (!p.exp || Date.now() > p.exp) return null;
+    return p;
+  } catch { return null; }
+}
+
+// reporta evento da ligação de volta ao Conversas (grava na tabela chamadas / Registro)
+async function reportarEvento(tipo, c, extra) {
+  const base = process.env.CONVERSAS_URL;
+  if (!base) return;
+  const operadorReal = c.operadorId && !String(c.operadorId).startsWith("dev:") ? c.operadorId : null;
+  try {
+    await fetch(base.replace(/\/+$/, "") + "/voz/evento", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-voz-secret": process.env.VOZ_SECRET || "" },
+      body: JSON.stringify({ tipo, call_id: c.call_id, operador_id: operadorReal, ...(extra || {}) }),
+    });
+  } catch (e) { console.error("[voz] falha reportarEvento:", e.message); }
 }
 
 // ---- estado ----
@@ -167,6 +195,16 @@ wss.on("connection", (ws) => {
   ws.on("message", async (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
 
+    if (m.tipo === "hello") {
+      const p = verificarTicketVoz(m.ticket);
+      if (!p) { try { ws.send(JSON.stringify({ tipo: "erro", msg: "ticket inválido" })); } catch {} return; }
+      ws._info = { nome: p.nome || "Operador", departamentos: Array.isArray(p.departamentos) ? p.departamentos : [], operador_id: p.operador_id, papel: p.papel || "atendente" };
+      operadores.add(ws);
+      try { ws.send(JSON.stringify({ tipo: "conectado", nome: ws._info.nome, departamentos: ws._info.departamentos })); } catch {}
+      console.log(`[voz] operador "${ws._info.nome}" (${ws._info.operador_id}) conectado; deptos: ${ws._info.departamentos.length}`);
+      return;
+    }
+
     if (m.tipo === "hello_dev") {
       if (process.env.VOZ_DEV !== "1") { try { ws.send(JSON.stringify({ tipo: "erro", msg: "modo dev desativado" })); } catch {} return; }
       ws._info = { nome: m.nome || "Operador", departamentos: Array.isArray(m.departamentos) ? m.departamentos : [], operador_id: "dev:" + (m.nome || "op") };
@@ -230,6 +268,7 @@ async function atender(ws, call_id, browserOffer) {
     const acc = await metaCalls(c.phoneId, { messaging_product: "whatsapp", call_id, action: "accept", session: sess });
     console.log(`[voz][meta ${call_id}] accept:`, acc.status);
     c.iniciada = Date.now();
+    reportarEvento("atendida", c);
   } catch (e) {
     console.error(`[voz] erro ao atender ${call_id}:`, e?.message || e);
     desligar(call_id, "erro");
@@ -246,8 +285,9 @@ function desligar(call_id, motivo) {
   try { c.operatorPc?.close?.(); } catch {}
   if (c.operadorWs?.readyState === 1) try { c.operadorWs.send(JSON.stringify({ tipo: "encerrada", call_id, motivo })); } catch {}
   clearTimeout(c.timer);
-  chamadas.delete(call_id);
   const dur = c.iniciada ? Math.round((Date.now() - c.iniciada) / 1000) : 0;
+  if (c.iniciada) reportarEvento("encerrada", c, { duracao_seg: dur });
+  chamadas.delete(call_id);
   console.log(`[voz] chamada ${call_id} desligada (${motivo}); duração ${dur}s`);
 }
 
