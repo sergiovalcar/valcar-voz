@@ -1,14 +1,18 @@
 // ============================================================
-// valcar-voz — Fase 2, tijolo 1: ECO DE ÁUDIO (meia-ponte)
+// valcar-voz — Fase 2, ponte completa (Entrega 1: núcleo testável)
 // >>> No repositório, este arquivo deve se chamar  server.js  <<<
 // ------------------------------------------------------------
-// Valida a API de MÍDIA do werift sobre o UDP do Railway:
-// navegador (mic) -> werift -> de volta pro navegador (alto-falante).
-// Se você falar (de fone!) e ouvir sua própria voz, o caminho de áudio
-// RTP funciona — é o mesmo mecanismo que a ponte Meta<->navegador usará.
+// Liga a perna da Meta (cliente no WhatsApp) com a perna do operador
+// (navegador). Roteamento por DEPARTAMENTO (dinâmico, decidido pelo
+// Conversas). Ringback nativo: só dá accept na Meta quando um operador
+// atende. Se ninguém atender em 30s -> perdida.
 //
-// Próximo passo depois deste: trocar a "perna do navegador" de um dos
-// lados pela "perna da Meta" (oferta SDP do webhook calls + accept).
+// Tela de teste do operador: GET /operador  (requer VOZ_DEV=1)
+//
+// Variáveis (Railway, serviço valcar-voz):
+//  WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, GRAPH_VERSION (v21.0),
+//  VOZ_SECRET, VOZ_DEV (=1 p/ liberar a tela de operador de teste),
+//  STUN_URL/TURN_URL/TURN_USER/TURN_PASS/FORCE_RELAY (opcionais)
 // ============================================================
 
 import express from "express";
@@ -17,24 +21,19 @@ import { createServer } from "http";
 import { RTCPeerConnection, MediaStreamTrack } from "werift";
 
 const PORT = process.env.PORT || 8080;
+const GRAPH_VERSION = process.env.GRAPH_VERSION || "v21.0";
+const FORCE_RELAY = process.env.FORCE_RELAY === "1";
 process.on("uncaughtException", (e) => console.error("[voz] uncaughtException:", e?.message || e));
 process.on("unhandledRejection", (e) => console.error("[voz] unhandledRejection:", e?.message || e));
 
 function iceServers() {
   const lista = [{ urls: process.env.STUN_URL || "stun:stun.l.google.com:19302" }];
-  if (process.env.TURN_URL) {
-    lista.push({ urls: process.env.TURN_URL, username: process.env.TURN_USER || "", credential: process.env.TURN_PASS || "" });
-  }
+  if (process.env.TURN_URL) lista.push({ urls: process.env.TURN_URL, username: process.env.TURN_USER || "", credential: process.env.TURN_PASS || "" });
   return lista;
 }
-const FORCE_RELAY = process.env.FORCE_RELAY === "1";
+function rtcConfig() { const c = { iceServers: iceServers() }; if (FORCE_RELAY) c.iceTransportPolicy = "relay"; return c; }
+function setupAtivo(sdp) { return sdp.replace(/a=setup:actpass/g, "a=setup:active").replace(/a=setup:passive/g, "a=setup:active"); }
 
-const app = express();
-app.use(express.json({ limit: "1mb" }));
-const GRAPH_VERSION = process.env.GRAPH_VERSION || "v21.0";
-const chamadasMeta = new Map(); // call_id -> RTCPeerConnection (perna da Meta)
-
-// chama o endpoint /calls da Graph API (pre_accept / accept / terminate)
 async function metaCalls(phoneId, body) {
   try {
     const r = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${phoneId}/calls`, {
@@ -44,223 +43,221 @@ async function metaCalls(phoneId, body) {
     });
     const j = await r.json().catch(() => ({}));
     return { ok: r.ok, status: r.status, json: j };
-  } catch (e) {
-    return { ok: false, status: 0, json: { erro: e?.message } };
-  }
+  } catch (e) { return { ok: false, status: 0, json: { erro: e?.message } }; }
 }
 
+// ---- estado ----
+const operadores = new Set(); // ws (cada um com ws._info = {nome, departamentos:[], operador_id})
+const chamadas = new Map();    // call_id -> { estado, offerSdp, phoneId, metaPc, operatorPc, operadorWs, ... }
+
+function operadoresDoDepto(deptId) {
+  return [...operadores].filter((ws) => ws.readyState === 1 && ws._info && (!deptId || ws._info.departamentos.includes(deptId)));
+}
+function avisarOperadores(filtroWsExcluir, payload) {
+  for (const op of operadores) if (op !== filtroWsExcluir && op.readyState === 1) { try { op.send(JSON.stringify(payload)); } catch {} }
+}
+
+// ---- HTTP ----
+const app = express();
+app.use(express.json({ limit: "1mb" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
-app.get("/", (_req, res) => res.type("html").send(PAGINA));
+app.get("/", (_req, res) => res.redirect("/operador"));
+app.get("/operador", (_req, res) => res.type("html").send(PAGINA_OPERADOR));
 
-// ------------------------------------------------------------
-// PERNA DA META (Fase 2, teste isolado): recebe a oferta SDP encaminhada
-// pelo Conversas, monta a conexão WebRTC com a Meta, aceita a chamada
-// (pre_accept -> accept) e ECOA o áudio do cliente de volta (o cliente
-// ouve a própria voz). Valida o handshake + o áudio da perna da Meta.
-// ------------------------------------------------------------
-app.post("/chamada", async (req, res) => {
-  if ((req.headers["x-voz-secret"] || "") !== (process.env.VOZ_SECRET || "")) {
-    return res.status(403).json({ erro: "secret inválido" });
-  }
-  const { call_id, sdp, phone_number_id } = req.body || {};
-  res.json({ ok: true }); // responde rápido; o accept acontece em seguida
-  if (!call_id || !sdp) { console.error("[voz][meta] /chamada sem call_id/sdp"); return; }
+// chamada recebida (encaminhada pelo Conversas no evento connect)
+app.post("/chamada", (req, res) => {
+  if ((req.headers["x-voz-secret"] || "") !== (process.env.VOZ_SECRET || "")) return res.status(403).json({ erro: "secret" });
+  const { call_id, from, nome, conversa_id, departamento_id, phone_number_id, sdp } = req.body || {};
+  res.json({ ok: true });
+  if (!call_id || !sdp) { console.error("[voz] /chamada sem call_id/sdp"); return; }
   const phoneId = phone_number_id || process.env.WHATSAPP_PHONE_NUMBER_ID;
-  console.log(`[voz][meta ${call_id}] chamada recebida; montando WebRTC…`);
+  const c = { call_id, from, nome: nome || from, conversa_id, departamento_id, phoneId, offerSdp: sdp, estado: "tocando", metaPc: null, operatorPc: null, operadorWs: null, iniciada: 0, timer: null };
+  chamadas.set(call_id, c);
+  const alvo = operadoresDoDepto(departamento_id);
+  console.log(`[voz] chamada ${call_id} de ${c.nome}: tocando p/ ${alvo.length} operador(es) do depto ${departamento_id || "—"}`);
+  for (const op of alvo) { try { op.send(JSON.stringify({ tipo: "chamada_recebida", call_id, from, nome: c.nome, conversa_id, departamento_id })); } catch {} }
+  // 30s sem atender -> perdida (encerra e some da UI)
+  c.timer = setTimeout(() => {
+    if (c.estado !== "tocando") return;
+    c.estado = "encerrada";
+    metaCalls(phoneId, { messaging_product: "whatsapp", call_id, action: "terminate" }).catch(() => {});
+    avisarOperadores(null, { tipo: "chamada_expirada", call_id });
+    chamadas.delete(call_id);
+    console.log(`[voz] chamada ${call_id} expirada (perdida)`);
+  }, 30000);
+});
 
-  try {
-    const config = { iceServers: iceServers() };
-    if (FORCE_RELAY) config.iceTransportPolicy = "relay";
-    const pc = new RTCPeerConnection(config);
-    chamadasMeta.set(call_id, pc);
-
-    pc.iceConnectionStateChange.subscribe((s) => console.log(`[voz][meta ${call_id}] ice:`, s));
-    pc.connectionStateChange.subscribe((s) => {
-      console.log(`[voz][meta ${call_id}] pc:`, s);
-      if (s === "closed" || s === "failed" || s === "disconnected") { try { pc.close?.(); } catch {} chamadasMeta.delete(call_id); }
-    });
-
-    // eco: o áudio do cliente volta pra ele mesmo
-    const echoTrack = new MediaStreamTrack({ kind: "audio" });
-    pc.addTransceiver(echoTrack, { direction: "sendrecv" });
-    pc.onTrack.subscribe((track) => {
-      const t = track?.onReceiveRtp ? track : track?.track;
-      if (!t?.onReceiveRtp) return;
-      let n = 0;
-      t.onReceiveRtp.subscribe((rtp) => {
-        n++;
-        if (n === 1) console.log(`[voz][meta ${call_id}] áudio do cliente fluindo (RTP recebido)`);
-        try { echoTrack.writeRtp(rtp); } catch (e) { if (n < 3) console.error("writeRtp:", e?.message); }
-      });
-    });
-
-    await pc.setRemoteDescription({ type: "offer", sdp });
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    // a Meta exige a=setup:active no SDP de resposta do negócio
-    const answerSdp = pc.localDescription.sdp
-      .replace(/a=setup:actpass/g, "a=setup:active")
-      .replace(/a=setup:passive/g, "a=setup:active");
-
-    // ordem obrigatória: pre_accept ANTES de accept
-    const sess = { sdp_type: "answer", sdp: answerSdp };
-    const pre = await metaCalls(phoneId, { messaging_product: "whatsapp", call_id, action: "pre_accept", session: sess });
-    console.log(`[voz][meta ${call_id}] pre_accept:`, pre.status, JSON.stringify(pre.json));
-    const acc = await metaCalls(phoneId, { messaging_product: "whatsapp", call_id, action: "accept", session: sess });
-    console.log(`[voz][meta ${call_id}] accept:`, acc.status, JSON.stringify(acc.json));
-  } catch (e) {
-    console.error(`[voz][meta ${call_id}] erro:`, e?.message || e);
-  }
+// chamada encerrada pelo lado da Meta (cliente desligou) — encaminhada pelo Conversas
+app.post("/chamada-fim", (req, res) => {
+  if ((req.headers["x-voz-secret"] || "") !== (process.env.VOZ_SECRET || "")) return res.status(403).json({ erro: "secret" });
+  const { call_id } = req.body || {};
+  res.json({ ok: true });
+  const c = chamadas.get(call_id);
+  if (!c || c.estado === "encerrada") { chamadas.delete(call_id); return; }
+  const tocando = c.estado === "tocando";
+  c.estado = "encerrada";
+  try { c.metaPc?.close?.(); } catch {}
+  try { c.operatorPc?.close?.(); } catch {}
+  if (c.operadorWs?.readyState === 1) try { c.operadorWs.send(JSON.stringify({ tipo: "encerrada", call_id, motivo: "cliente" })); } catch {}
+  if (tocando) avisarOperadores(null, { tipo: "chamada_expirada", call_id });
+  clearTimeout(c.timer);
+  chamadas.delete(call_id);
+  console.log(`[voz] chamada ${call_id} encerrada pelo cliente`);
 });
 
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer });
 
-function avisar(ws, evento, dado) {
-  try { ws.send(JSON.stringify({ tipo: "log", evento, dado })); } catch {}
-  console.log(`[voz] ${evento}`, dado ?? "");
-}
-
 wss.on("connection", (ws) => {
-  console.log("[voz] navegador conectado ao WebSocket");
-  let pc = null;
-
   ws.on("message", async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    let m; try { m = JSON.parse(raw.toString()); } catch { return; }
 
-    if (msg.tipo === "offer") {
-      try {
-        const config = { iceServers: iceServers() };
-        if (FORCE_RELAY) config.iceTransportPolicy = "relay";
-        pc = new RTCPeerConnection(config);
-
-        pc.iceConnectionStateChange.subscribe((s) => avisar(ws, "iceConnectionState", s));
-        pc.connectionStateChange.subscribe((s) => avisar(ws, "connectionState", s));
-
-        // track que VAMOS ENVIAR de volta (o eco). Adicionado antes do setRemoteDescription
-        // para casar com a m-line de áudio que vem na oferta do navegador.
-        const echoTrack = new MediaStreamTrack({ kind: "audio" });
-        pc.addTransceiver(echoTrack, { direction: "sendrecv" });
-
-        // track que RECEBEMOS (a voz do navegador) -> repassa cada pacote RTP de volta
-        pc.onTrack.subscribe((track) => {
-          const t = track?.onReceiveRtp ? track : track?.track;
-          if (!t?.onReceiveRtp) { avisar(ws, "erro_servidor", "track recebida sem onReceiveRtp"); return; }
-          avisar(ws, "track_recebida", t.kind);
-          let n = 0;
-          t.onReceiveRtp.subscribe((rtp) => {
-            n++;
-            if (n === 1) avisar(ws, "audio_fluindo", "primeiro pacote RTP recebido");
-            try { echoTrack.writeRtp(rtp); } catch (e) { if (n < 3) console.error("writeRtp:", e?.message); }
-          });
-        });
-
-        await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({ tipo: "answer", sdp: pc.localDescription.sdp }));
-      } catch (e) {
-        console.error("[voz] erro ao responder oferta:", e);
-        avisar(ws, "erro_servidor", String(e?.message || e));
-      }
+    if (m.tipo === "hello_dev") {
+      if (process.env.VOZ_DEV !== "1") { try { ws.send(JSON.stringify({ tipo: "erro", msg: "modo dev desativado" })); } catch {} return; }
+      ws._info = { nome: m.nome || "Operador", departamentos: Array.isArray(m.departamentos) ? m.departamentos : [], operador_id: "dev:" + (m.nome || "op") };
+      operadores.add(ws);
+      try { ws.send(JSON.stringify({ tipo: "conectado", nome: ws._info.nome, departamentos: ws._info.departamentos })); } catch {}
+      console.log(`[voz] operador(dev) "${ws._info.nome}" conectado; deptos: ${ws._info.departamentos.length}`);
       return;
     }
+    if (m.tipo === "atender") return atender(ws, m.call_id, m.sdp);
+    if (m.tipo === "desligar") return desligar(m.call_id, "operador");
+    // "recusar": só esconde local no operador; a chamada segue tocando p/ os demais
   });
 
-  ws.on("close", () => { console.log("[voz] navegador desconectou"); try { pc?.close?.(); } catch {} });
+  ws.on("close", () => {
+    operadores.delete(ws);
+    for (const [cid, c] of chamadas) if (c.operadorWs === ws && c.estado === "atendida") desligar(cid, "operador_saiu");
+  });
 });
+
+async function atender(ws, call_id, browserOffer) {
+  const c = chamadas.get(call_id);
+  if (!c || c.estado !== "tocando") { try { ws.send(JSON.stringify({ tipo: "chamada_indisponivel", call_id })); } catch {} return; }
+  c.estado = "atendida"; c.operadorWs = ws; c.operadorId = ws._info?.operador_id || null;
+  clearTimeout(c.timer);
+  avisarOperadores(ws, { tipo: "chamada_assumida", call_id });
+  console.log(`[voz] chamada ${call_id} atendida por "${ws._info?.nome}"`);
+
+  try {
+    const metaPc = new RTCPeerConnection(rtcConfig());
+    const operatorPc = new RTCPeerConnection(rtcConfig());
+    c.metaPc = metaPc; c.operatorPc = operatorPc;
+
+    const paraMeta = new MediaStreamTrack({ kind: "audio" });      // voz do operador -> cliente
+    const paraOperador = new MediaStreamTrack({ kind: "audio" });  // voz do cliente -> operador
+    metaPc.addTransceiver(paraMeta, { direction: "sendrecv" });
+    operatorPc.addTransceiver(paraOperador, { direction: "sendrecv" });
+
+    metaPc.onTrack.subscribe((tr) => {
+      const t = tr?.onReceiveRtp ? tr : tr?.track; if (!t?.onReceiveRtp) return;
+      t.onReceiveRtp.subscribe((rtp) => { try { paraOperador.writeRtp(rtp); } catch {} });
+    });
+    operatorPc.onTrack.subscribe((tr) => {
+      const t = tr?.onReceiveRtp ? tr : tr?.track; if (!t?.onReceiveRtp) return;
+      t.onReceiveRtp.subscribe((rtp) => { try { paraMeta.writeRtp(rtp); } catch {} });
+    });
+    metaPc.connectionStateChange.subscribe((s) => console.log(`[voz][meta ${call_id}] pc:`, s));
+    operatorPc.connectionStateChange.subscribe((s) => console.log(`[voz][op ${call_id}] pc:`, s));
+
+    // perna do operador (navegador é o offerer): responde
+    await operatorPc.setRemoteDescription({ type: "offer", sdp: browserOffer });
+    const oAns = await operatorPc.createAnswer(); await operatorPc.setLocalDescription(oAns);
+    try { ws.send(JSON.stringify({ tipo: "resposta", call_id, sdp: operatorPc.localDescription.sdp })); } catch {}
+
+    // perna da Meta: gera answer e ACEITA agora (pre_accept -> accept)
+    await metaPc.setRemoteDescription({ type: "offer", sdp: c.offerSdp });
+    const mAns = await metaPc.createAnswer(); await metaPc.setLocalDescription(mAns);
+    const sess = { sdp_type: "answer", sdp: setupAtivo(metaPc.localDescription.sdp) };
+    const pre = await metaCalls(c.phoneId, { messaging_product: "whatsapp", call_id, action: "pre_accept", session: sess });
+    console.log(`[voz][meta ${call_id}] pre_accept:`, pre.status);
+    const acc = await metaCalls(c.phoneId, { messaging_product: "whatsapp", call_id, action: "accept", session: sess });
+    console.log(`[voz][meta ${call_id}] accept:`, acc.status);
+    c.iniciada = Date.now();
+  } catch (e) {
+    console.error(`[voz] erro ao atender ${call_id}:`, e?.message || e);
+    desligar(call_id, "erro");
+  }
+}
+
+function desligar(call_id, motivo) {
+  const c = chamadas.get(call_id);
+  if (!c || c.estado === "encerrada") { chamadas.delete(call_id); return; }
+  c.estado = "encerrada";
+  metaCalls(c.phoneId, { messaging_product: "whatsapp", call_id, action: "terminate" }).catch(() => {});
+  try { c.metaPc?.close?.(); } catch {}
+  try { c.operatorPc?.close?.(); } catch {}
+  if (c.operadorWs?.readyState === 1) try { c.operadorWs.send(JSON.stringify({ tipo: "encerrada", call_id, motivo })); } catch {}
+  clearTimeout(c.timer);
+  chamadas.delete(call_id);
+  const dur = c.iniciada ? Math.round((Date.now() - c.iniciada) / 1000) : 0;
+  console.log(`[voz] chamada ${call_id} desligada (${motivo}); duração ${dur}s`);
+}
 
 httpServer.listen(PORT, () => {
-  console.log(`[voz] eco de áudio no ar na porta ${PORT}`);
-  console.log(`[voz] ICE servers:`, JSON.stringify(iceServers()), "FORCE_RELAY:", FORCE_RELAY);
+  console.log(`[voz] ponte no ar na porta ${PORT}; ICE:`, JSON.stringify(iceServers()), "DEV:", process.env.VOZ_DEV === "1");
 });
 
-const PAGINA = `<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>valcar-voz — eco de áudio</title>
-<style>
-  body{font-family:system-ui,Segoe UI,Roboto,sans-serif;max-width:680px;margin:30px auto;padding:0 16px;color:#1d1d1f}
-  h1{font-size:20px}
-  button{font-size:15px;font-weight:600;background:#EB3237;color:#fff;border:0;border-radius:10px;padding:10px 18px;cursor:pointer}
-  button:disabled{opacity:.5;cursor:default}
-  .estado{font-size:15px;margin:14px 0;padding:12px 14px;border-radius:10px;background:#f5f5f7}
-  .ok{background:#e7f6ec;color:#1a7f37}
-  .falha{background:#fdecec;color:#b3272c}
-  .aviso{background:#fff7e6;color:#8a6d00;font-size:13.5px}
-  pre{background:#0d1117;color:#c9d1d9;font-size:12.5px;padding:12px;border-radius:10px;overflow:auto;max-height:320px}
-  .dim{color:#86868b}
-</style></head>
-<body>
-  <h1>valcar-voz — eco de áudio (teste da ponte)</h1>
-  <p class="dim">Clica em "Iniciar", autoriza o microfone e fala. Sua voz vai até o servidor (Railway) e volta — você deve se ouvir com um pequeno atraso.</p>
-  <div class="estado aviso">⚠️ Use <b>fone de ouvido</b> para evitar microfonia (o eco realimentando o microfone).</div>
-  <button id="btn" onclick="iniciar()">Iniciar</button>
-  <div class="estado" id="estado">Aguardando…</div>
-  <audio id="saida" autoplay></audio>
-  <pre id="logs"></pre>
-<script>
-const ICE_DO_BROWSER = [{ urls: "stun:stun.l.google.com:19302" }];
-const E = (id)=>document.getElementById(id);
-function log(t){ E("logs").textContent += t + "\\n"; }
-function estado(t, cls){ E("estado").textContent = t; E("estado").className = "estado " + (cls||""); }
-
-async function iniciar(){
-  E("btn").disabled = true;
-  E("logs").textContent = "";
-  estado("Pedindo acesso ao microfone…");
-
-  let stream;
-  try{ stream = await navigator.mediaDevices.getUserMedia({ audio:true, video:false }); }
-  catch(e){ estado("Sem acesso ao microfone: " + e.message, "falha"); E("btn").disabled=false; return; }
-
-  const wsUrl = (location.protocol==="https:"?"wss://":"ws://") + location.host;
-  const ws = new WebSocket(wsUrl);
-  ws.onerror = ()=>{ estado("Falha no WebSocket.", "falha"); E("btn").disabled=false; };
-
-  ws.onopen = async ()=>{
-    log("WebSocket aberto.");
-    const pc = new RTCPeerConnection({ iceServers: ICE_DO_BROWSER });
-    window._pc = pc;
-
-    // envia o microfone
-    stream.getTracks().forEach(t => pc.addTrack(t, stream));
-
-    // toca o que voltar (o eco)
-    pc.ontrack = (ev)=>{
-      log("Recebendo áudio de volta (track).");
-      E("saida").srcObject = ev.streams[0] || new MediaStream([ev.track]);
-      E("saida").play().catch(()=>{});
-      window._ouviu = true;
-      estado("✅ Conectado — fale e você deve ouvir sua voz (com atraso).", "ok");
-    };
-
-    pc.oniceconnectionstatechange = ()=> log("ICE(browser): " + pc.iceConnectionState);
-    pc.onconnectionstatechange = ()=>{
-      log("PC(browser): " + pc.connectionState);
-      if(pc.connectionState==="connected" && !window._ouviu) estado("Conectado — aguardando o áudio de volta…", "ok");
-      if(pc.connectionState==="failed") estado("Não conectou.", "falha");
-    };
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await new Promise((resolve)=>{
-      if(pc.iceGatheringState==="complete") return resolve();
-      const t = setTimeout(resolve, 3000);
-      pc.onicegatheringstatechange = ()=>{ if(pc.iceGatheringState==="complete"){ clearTimeout(t); resolve(); } };
-    });
-    estado("Negociando conexão…");
-    ws.send(JSON.stringify({ tipo:"offer", sdp: pc.localDescription.sdp }));
-  };
-
-  ws.onmessage = async (ev)=>{
-    const m = JSON.parse(ev.data);
-    if(m.tipo==="answer"){ await window._pc.setRemoteDescription({ type:"answer", sdp:m.sdp }); log("Resposta do servidor aplicada."); }
-    if(m.tipo==="log"){ log("[servidor] " + m.evento + ": " + JSON.stringify(m.dado)); }
-  };
-
-  setTimeout(()=>{ if(!window._ouviu && window._pc && window._pc.connectionState!=="connected"){ estado("Não conectou em 12s.", "falha"); E("btn").disabled=false; } }, 12000);
-}
-</script>
-</body></html>`;
+// ------------------------------------------------------------
+// Tela de operador de teste (GET /operador). Sem template literals
+// aninhados (usa concatenação) p/ não quebrar esta string.
+// ------------------------------------------------------------
+const PAGINA_OPERADOR = '<!doctype html>'
++ '<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
++ '<title>valcar-voz — operador (teste)</title><style>'
++ 'body{font-family:system-ui,Segoe UI,Roboto,sans-serif;max-width:560px;margin:24px auto;padding:0 16px;color:#1d1d1f}'
++ 'h1{font-size:19px}button{font-size:15px;font-weight:600;border:0;border-radius:10px;padding:10px 16px;cursor:pointer}'
++ '.vermelho{background:#EB3237;color:#fff}.verde{background:#1a7f37;color:#fff}.cinza{background:#e5e5ea;color:#1d1d1f}'
++ '.cartao{border:1px solid #e5e5ea;border-radius:12px;padding:16px;margin:14px 0}'
++ '.dim{color:#86868b;font-size:13.5px}label{display:block;margin:6px 0}.oculto{display:none}'
++ '#log{background:#0d1117;color:#c9d1d9;font-size:12px;padding:10px;border-radius:8px;max-height:220px;overflow:auto;white-space:pre-wrap}'
++ '</style></head><body>'
++ '<h1>Operador (teste de voz)</h1>'
++ '<div class="cartao" id="conexao">'
++ '<label>Seu nome <input id="nome" value="Sérgio" style="padding:6px;border:1px solid #ccc;border-radius:6px"></label>'
++ '<div class="dim">Departamentos que você atende:</div><div id="depts"></div>'
++ '<button class="verde" onclick="conectar()">Conectar</button> <span id="status" class="dim">desconectado</span>'
++ '</div>'
++ '<div class="cartao oculto" id="tocando"><b id="quemliga"></b><div class="dim" id="deptliga"></div><br>'
++ '<button class="verde" onclick="atender()">Atender</button> <button class="cinza" onclick="recusar()">Recusar</button></div>'
++ '<div class="cartao oculto" id="emchamada"><b>Em chamada</b> — <span id="cron">00:00</span><br><br>'
++ '<button class="vermelho" onclick="desligar()">Desligar</button></div>'
++ '<audio id="saida" autoplay></audio>'
++ '<div id="log"></div>'
++ '<script>'
++ 'var DEPTS=[{id:"6a57083b-2a59-4a30-8eba-f76dd8c613c5",nome:"Atendimento Geral"},{id:"f481a2e1-aa31-417a-b35a-b9bae34c8802",nome:"Checagem/Qualidade"},{id:"bae7efb1-417b-4c8b-9fb3-cb1d72e6e849",nome:"Reten\\u00e7\\u00e3o e Negocia\\u00e7\\u00e3o"},{id:"be8cb40f-b275-4137-ae20-73f2c77862a3",nome:"Vendas"}];'
++ 'var ws,pc,callId,cronT,ac;'
++ 'function $(i){return document.getElementById(i)}'
++ 'function log(t){$("log").textContent+=t+"\\n";$("log").scrollTop=1e9}'
++ 'DEPTS.forEach(function(d){$("depts").innerHTML+=\'<label><input type="checkbox" value="\'+d.id+\'" checked> \'+d.nome+\'</label>\'});'
++ 'function deptsSel(){return [].slice.call($("depts").querySelectorAll("input:checked")).map(function(i){return i.value})}'
++ 'function nomeDept(id){for(var i=0;i<DEPTS.length;i++)if(DEPTS[i].id===id)return DEPTS[i].nome;return "—"}'
++ 'function beep(){try{if(!ac)return;var o=ac.createOscillator(),g=ac.createGain();o.frequency.value=480;g.gain.value=0.06;o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+0.25)}catch(e){}}'
++ 'var ringT;function ring(on){if(on){beep();ringT=setInterval(beep,1500)}else{clearInterval(ringT)}}'
++ 'function conectar(){ac=new (window.AudioContext||window.webkitAudioContext)();ac.resume();'
++ ' var u=(location.protocol==="https:"?"wss://":"ws://")+location.host;ws=new WebSocket(u);'
++ ' ws.onopen=function(){ws.send(JSON.stringify({tipo:"hello_dev",nome:$("nome").value,departamentos:deptsSel()}));};'
++ ' ws.onmessage=onMsg;ws.onclose=function(){$("status").textContent="desconectado"};ws.onerror=function(){$("status").textContent="erro WS"};}'
++ 'function onMsg(ev){var m=JSON.parse(ev.data);'
++ ' if(m.tipo==="conectado"){$("status").textContent="conectado ("+m.departamentos.length+" deptos)";log("Conectado.");}'
++ ' if(m.tipo==="erro"){$("status").textContent=m.msg;log("Erro: "+m.msg);}'
++ ' if(m.tipo==="chamada_recebida"){callId=m.call_id;$("quemliga").textContent="Ligação de "+(m.nome||m.from);$("deptliga").textContent=nomeDept(m.departamento_id);$("tocando").classList.remove("oculto");ring(true);log("Tocando: "+m.call_id);}'
++ ' if(m.tipo==="chamada_assumida"||m.tipo==="chamada_expirada"){if(m.call_id===callId){fimUI();log(m.tipo);}}'
++ ' if(m.tipo==="chamada_indisponivel"){fimUI();log("Indisponível (já assumida).");}'
++ ' if(m.tipo==="resposta"){pc.setRemoteDescription({type:"answer",sdp:m.sdp});log("Resposta aplicada — áudio deve começar.");}'
++ ' if(m.tipo==="encerrada"){log("Encerrada ("+(m.motivo||"")+").");fimChamada();}}'
++ 'function recusar(){ring(false);$("tocando").classList.add("oculto");if(ws)ws.send(JSON.stringify({tipo:"recusar",call_id:callId}));}'
++ 'function fimUI(){ring(false);$("tocando").classList.add("oculto");}'
++ 'async function atender(){ring(false);$("tocando").classList.add("oculto");'
++ ' var stream;try{stream=await navigator.mediaDevices.getUserMedia({audio:true})}catch(e){log("Sem mic: "+e.message);return;}'
++ ' pc=new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});'
++ ' stream.getTracks().forEach(function(t){pc.addTrack(t,stream)});'
++ ' pc.ontrack=function(e){$("saida").srcObject=e.streams[0]||new MediaStream([e.track]);$("saida").play().catch(function(){});};'
++ ' pc.onconnectionstatechange=function(){log("PC: "+pc.connectionState);if(pc.connectionState==="connected")emChamada();};'
++ ' var off=await pc.createOffer();await pc.setLocalDescription(off);'
++ ' await new Promise(function(r){if(pc.iceGatheringState==="complete")return r();var t=setTimeout(r,3000);pc.onicegatheringstatechange=function(){if(pc.iceGatheringState==="complete"){clearTimeout(t);r()}}});'
++ ' ws.send(JSON.stringify({tipo:"atender",call_id:callId,sdp:pc.localDescription.sdp}));log("Atendendo…");}'
++ 'function emChamada(){$("emchamada").classList.remove("oculto");var s=Date.now();cronT=setInterval(function(){var d=Math.floor((Date.now()-s)/1000);var mm=String(Math.floor(d/60)).padStart(2,"0"),ss=String(d%60).padStart(2,"0");$("cron").textContent=mm+":"+ss},500);}'
++ 'function desligar(){if(ws)ws.send(JSON.stringify({tipo:"desligar",call_id:callId}));fimChamada();}'
++ 'function fimChamada(){clearInterval(cronT);$("emchamada").classList.add("oculto");try{pc&&pc.close()}catch(e){}pc=null;$("saida").srcObject=null;}'
++ '</script></body></html>';
