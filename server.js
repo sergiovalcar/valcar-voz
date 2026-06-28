@@ -11,7 +11,9 @@
 //
 // Variáveis (Railway, serviço valcar-voz):
 //  WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, GRAPH_VERSION (v21.0),
-//  VOZ_SECRET, VOZ_DEV (=1 p/ liberar a tela de operador de teste),
+//  VOZ_SECRET (obrigatória — HMAC dos tickets + header x-voz-secret),
+//  CONVERSAS_URL (obrigatória p/ reportar eventos de volta ao Conversas),
+//  VOZ_DEV (=1 p/ liberar a tela de operador de teste),
 //  STUN_URL/TURN_URL/TURN_USER/TURN_PASS/FORCE_RELAY (opcionais)
 // ============================================================
 
@@ -24,6 +26,24 @@ import { RTCPeerConnection, MediaStreamTrack } from "werift";
 const PORT = process.env.PORT || 8080;
 const GRAPH_VERSION = process.env.GRAPH_VERSION || "v21.0";
 const FORCE_RELAY = process.env.FORCE_RELAY === "1";
+
+// Segredo obrigatório: sem ele, tickets e header x-voz-secret não têm valor de
+// segurança (o fallback fraco "x" foi removido). Aborta o boot se faltar.
+if (!process.env.VOZ_SECRET) {
+  console.error("[voz] FATAL: VOZ_SECRET não definido — abortando para não subir sem autenticação.");
+  process.exit(1);
+}
+if (!process.env.CONVERSAS_URL) {
+  console.warn("[voz] AVISO: CONVERSAS_URL não definido — eventos (atendida/encerrada) não serão reportados ao Conversas.");
+}
+
+// comparação de segredo em tempo constante (evita timing attack no x-voz-secret)
+function segredoOk(req) {
+  const recebido = Buffer.from(String(req.headers["x-voz-secret"] || ""));
+  const esperado = Buffer.from(String(process.env.VOZ_SECRET || ""));
+  if (recebido.length !== esperado.length) return false;
+  return crypto.timingSafeEqual(recebido, esperado);
+}
 process.on("uncaughtException", (e) => console.error("[voz] uncaughtException:", e?.message || e));
 process.on("unhandledRejection", (e) => console.error("[voz] unhandledRejection:", e?.message || e));
 
@@ -65,7 +85,7 @@ function verificarTicketVoz(ticket) {
   try {
     const [corpo, sig] = String(ticket || "").split(".");
     if (!corpo || !sig) return null;
-    const esperado = crypto.createHmac("sha256", process.env.VOZ_SECRET || "x").update(corpo).digest("hex");
+    const esperado = crypto.createHmac("sha256", process.env.VOZ_SECRET).update(corpo).digest("hex");
     if (sig !== esperado) return null;
     const p = JSON.parse(Buffer.from(corpo, "base64url").toString("utf8"));
     if (!p.exp || Date.now() > p.exp) return null;
@@ -81,7 +101,7 @@ async function reportarEvento(tipo, c, extra) {
   try {
     await fetch(base.replace(/\/+$/, "") + "/voz/evento", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-voz-secret": process.env.VOZ_SECRET || "" },
+      headers: { "Content-Type": "application/json", "x-voz-secret": process.env.VOZ_SECRET },
       body: JSON.stringify({ tipo, call_id: c.call_id, operador_id: operadorReal, ...(extra || {}) }),
     });
   } catch (e) { console.error("[voz] falha reportarEvento:", e.message); }
@@ -112,7 +132,7 @@ app.get("/operador", (_req, res) => res.type("html").send(PAGINA_OPERADOR));
 
 // chamada recebida (encaminhada pelo Conversas no evento connect)
 app.post("/chamada", async (req, res) => {
-  if ((req.headers["x-voz-secret"] || "") !== (process.env.VOZ_SECRET || "")) return res.status(403).json({ erro: "secret" });
+  if (!segredoOk(req)) return res.status(403).json({ erro: "secret" });
   const { call_id, from, nome, conversa_id, departamento_id, operador_id, mensagem_ocupado, mensagem_gravacao, phone_number_id, sdp } = req.body || {};
   res.json({ ok: true });
   if (!call_id || !sdp) { console.error("[voz] /chamada sem call_id/sdp"); return; }
@@ -171,7 +191,7 @@ app.post("/chamada", async (req, res) => {
 
 // chamada encerrada pelo lado da Meta (cliente desligou) — encaminhada pelo Conversas
 app.post("/chamada-fim", (req, res) => {
-  if ((req.headers["x-voz-secret"] || "") !== (process.env.VOZ_SECRET || "")) return res.status(403).json({ erro: "secret" });
+  if (!segredoOk(req)) return res.status(403).json({ erro: "secret" });
   const { call_id } = req.body || {};
   res.json({ ok: true });
   const c = chamadas.get(call_id);
