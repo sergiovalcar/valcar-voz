@@ -111,13 +111,18 @@ async function reportarEvento(tipo, c, extra) {
 const operadores = new Set(); // ws (cada um com ws._info = {nome, departamentos:[], operador_id})
 const chamadas = new Map();    // call_id -> { estado, offerSdp, phoneId, metaPc, operatorPc, operadorWs, ... }
 
-function disponivel(ws) { return ws.readyState === 1 && ws._info && !ws._emChamada; }
+// "presente na voz": conectado E não-ausente. O painel do Conversas informa a presença do
+// operador (online/ausente) por uma mensagem { tipo:"presenca" }. Ausente = indisponível para
+// receber ligação, igual a offline (cai para outro disponível ou para a fila do departamento).
+// Sem informação de presença (ex.: painel antigo / tela de teste), trata como presente.
+function presenteVoz(ws) { return ws.readyState === 1 && ws._info && ws._presenca !== "ausente"; }
+function disponivel(ws) { return presenteVoz(ws) && !ws._emChamada; }
 function operadoresDoDepto(deptId) {
   return [...operadores].filter((ws) => disponivel(ws) && (!deptId || ws._info.departamentos.includes(deptId)));
 }
-// online no depto, INCLUINDO ocupados (p/ distinguir "todos ocupados" de "ninguém online")
+// presentes no depto, INCLUINDO ocupados (p/ distinguir "todos ocupados" de "ninguém disponível")
 function onlineDoDepto(deptId) {
-  return [...operadores].filter((ws) => ws.readyState === 1 && ws._info && (!deptId || ws._info.departamentos.includes(deptId)));
+  return [...operadores].filter((ws) => presenteVoz(ws) && (!deptId || ws._info.departamentos.includes(deptId)));
 }
 function avisarOperadores(filtroWsExcluir, payload) {
   for (const op of operadores) if (op !== filtroWsExcluir && op.readyState === 1) { try { op.send(JSON.stringify(payload)); } catch {} }
@@ -141,11 +146,12 @@ app.post("/chamada", async (req, res) => {
   chamadas.set(call_id, c);
 
   // roteamento (em ordem):
-  //  (3) operador atribuído: online+livre -> só ele | online+ocupado -> OCUPADO | offline -> cai pro depto
-  //  (2)/(1) departamento (o da conversa ou o padrão): livres -> toca | todos ocupados -> OCUPADO | ninguém online -> perdida
+  //  (3) operador atribuído: presente+livre -> só ele | presente+ocupado -> OCUPADO | ausente/offline -> cai pro depto
+  //  (2)/(1) departamento (o da conversa ou o padrão): livres -> toca | todos ocupados -> OCUPADO | ninguém presente -> perdida
+  // "presente" = conectado e NÃO-ausente (presenteVoz). Operador ausente é tratado como offline.
   let alvo = [], modo = "", ocupado = false;
   if (operador_id) {
-    const online = [...operadores].filter((ws) => ws.readyState === 1 && ws._info && ws._info.operador_id === operador_id);
+    const online = [...operadores].filter((ws) => presenteVoz(ws) && ws._info.operador_id === operador_id);
     if (online.length) {
       const livres = online.filter(disponivel);
       if (livres.length) { alvo = livres; modo = "operador atribuído"; }
@@ -233,6 +239,8 @@ wss.on("connection", (ws) => {
       console.log(`[voz] operador(dev) "${ws._info.nome}" conectado; deptos: ${ws._info.departamentos.length}`);
       return;
     }
+    // presença informada pelo painel (online/ausente). Ausente -> não recebe novas ligações.
+    if (m.tipo === "presenca") { ws._presenca = (m.status === "ausente") ? "ausente" : "online"; return; }
     if (m.tipo === "atender") return atender(ws, m.call_id, m.sdp);
     if (m.tipo === "desligar") return desligar(m.call_id, "operador");
     if (m.tipo === "recusar") return recusar(ws, m.call_id);
