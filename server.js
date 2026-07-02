@@ -273,13 +273,29 @@ async function atender(ws, call_id, browserOffer) {
     metaPc.addTransceiver(paraMeta, { direction: "sendrecv" });
     operatorPc.addTransceiver(paraOperador, { direction: "sendrecv" });
 
+    // DIAGNÓSTICO de áudio (bug: operador não ouve o cliente; cliente ouve o operador).
+    // Loga se cada perna RECEBE mídia (onTrack) e conta os pacotes RTP em cada sentido, com o
+    // payload type, para revelar numa ligação real onde o caminho cliente->operador quebra.
+    let rtpCliente = 0, rtpOperador = 0;
     metaPc.onTrack.subscribe((tr) => {
-      const t = tr?.onReceiveRtp ? tr : tr?.track; if (!t?.onReceiveRtp) return;
-      t.onReceiveRtp.subscribe((rtp) => { try { paraOperador.writeRtp(rtp); } catch {} });
+      const t = tr?.onReceiveRtp ? tr : tr?.track;
+      if (!t?.onReceiveRtp) { console.log(`[voz][meta ${call_id}] onTrack SEM onReceiveRtp — cliente->operador NÃO liga`); return; }
+      console.log(`[voz][meta ${call_id}] onTrack do CLIENTE OK — recebendo áudio do cliente`);
+      t.onReceiveRtp.subscribe((rtp) => {
+        rtpCliente++;
+        if (rtpCliente === 1 || rtpCliente % 250 === 0) console.log(`[voz][meta ${call_id}] RTP do cliente #${rtpCliente} pt=${rtp?.header?.payloadType}`);
+        try { paraOperador.writeRtp(rtp); } catch (e) { if (rtpCliente % 250 === 1) console.log(`[voz][meta ${call_id}] writeRtp->operador falhou:`, e?.message); }
+      });
     });
     operatorPc.onTrack.subscribe((tr) => {
-      const t = tr?.onReceiveRtp ? tr : tr?.track; if (!t?.onReceiveRtp) return;
-      t.onReceiveRtp.subscribe((rtp) => { try { paraMeta.writeRtp(rtp); } catch {} });
+      const t = tr?.onReceiveRtp ? tr : tr?.track;
+      if (!t?.onReceiveRtp) { console.log(`[voz][op ${call_id}] onTrack SEM onReceiveRtp — operador->cliente NÃO liga`); return; }
+      console.log(`[voz][op ${call_id}] onTrack do OPERADOR OK — recebendo áudio do operador`);
+      t.onReceiveRtp.subscribe((rtp) => {
+        rtpOperador++;
+        if (rtpOperador === 1 || rtpOperador % 250 === 0) console.log(`[voz][op ${call_id}] RTP do operador #${rtpOperador} pt=${rtp?.header?.payloadType}`);
+        try { paraMeta.writeRtp(rtp); } catch (e) { if (rtpOperador % 250 === 1) console.log(`[voz][op ${call_id}] writeRtp->cliente falhou:`, e?.message); }
+      });
     });
     metaPc.connectionStateChange.subscribe((s) => console.log(`[voz][meta ${call_id}] pc:`, s));
     operatorPc.connectionStateChange.subscribe((s) => console.log(`[voz][op ${call_id}] pc:`, s));
@@ -292,6 +308,11 @@ async function atender(ws, call_id, browserOffer) {
     // perna da Meta: gera answer e ACEITA agora (pre_accept -> accept)
     await metaPc.setRemoteDescription({ type: "offer", sdp: c.offerSdp });
     const mAns = await metaPc.createAnswer(); await metaPc.setLocalDescription(mAns);
+    // codecs/payload-types negociados em cada perna (se o PT do cliente != do operador, o RTP
+    // repassado não é decodificado do lado do operador -> silêncio só nesse sentido).
+    const rtpmap = (sdp) => (String(sdp || "").match(/a=rtpmap:\d+ [^\r\n]+/g) || []).join(" | ");
+    console.log(`[voz][${call_id}] codecs META (cliente): ${rtpmap(metaPc.localDescription.sdp)}`);
+    console.log(`[voz][${call_id}] codecs OPERADOR: ${rtpmap(operatorPc.localDescription.sdp)}`);
     const sess = { sdp_type: "answer", sdp: setupAtivo(metaPc.localDescription.sdp) };
     const pre = await metaCalls(c.phoneId, { messaging_product: "whatsapp", call_id, action: "pre_accept", session: sess });
     console.log(`[voz][meta ${call_id}] pre_accept:`, pre.status);
