@@ -36,8 +36,8 @@ if (!process.env.VOZ_SECRET) {
 if (!process.env.CONVERSAS_URL) {
   console.warn("[voz] AVISO: CONVERSAS_URL não definido — eventos (atendida/encerrada) não serão reportados ao Conversas.");
 }
-if (!process.env.TURN_URL) {
-  console.warn("[voz] AVISO: TURN_URL não definido — sem servidor TURN, a perna navegador↔voz depende de conexão direta (STUN) e pode NÃO conectar atrás de NAT/firewall (o operador não ouve / não é ouvido). Configure TURN_URL/TURN_USER/TURN_PASS para áudio confiável.");
+if (!process.env.TURN_KEY_ID && !process.env.TURN_URL) {
+  console.warn("[voz] AVISO: sem TURN configurado (nem Cloudflare TURN_KEY_ID/TURN_API_TOKEN, nem TURN_URL estático) — a perna navegador↔voz depende de conexão direta (STUN) e pode NÃO conectar atrás de NAT/firewall (o operador não ouve / não é ouvido). Configure o TURN para áudio confiável.");
 }
 
 // comparação de segredo em tempo constante (evita timing attack no x-voz-secret)
@@ -50,17 +50,58 @@ function segredoOk(req) {
 process.on("uncaughtException", (e) => console.error("[voz] uncaughtException:", e?.message || e));
 process.on("unhandledRejection", (e) => console.error("[voz] unhandledRejection:", e?.message || e));
 
+// normaliza para entradas de URL ÚNICA (o werift não aceita urls como array).
+function expandirIce(entradas) {
+  const out = [];
+  for (const e of Array.isArray(entradas) ? entradas : [entradas]) {
+    if (!e) continue;
+    const urls = Array.isArray(e.urls) ? e.urls : [e.urls];
+    for (const u of urls.filter(Boolean)) {
+      const item = { urls: u };
+      if (e.username) item.username = e.username;
+      if (e.credential) item.credential = e.credential;
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+// ICE estático a partir das variáveis de ambiente (STUN_URL/TURN_URL, várias URLs por vírgula).
 function iceServers() {
-  // STUN e TURN aceitam MÚLTIPLAS URLs separadas por vírgula (ex.: TURN em 3478 UDP, 443 TCP e
-  // TLS) — quanto mais transportes, maior a chance de conectar em qualquer rede/firewall.
   const listar = (v) => String(v || "").split(",").map((s) => s.trim()).filter(Boolean);
   const stun = listar(process.env.STUN_URL);
-  const lista = [{ urls: stun.length ? stun : ["stun:stun.l.google.com:19302"] }];
+  const ent = [{ urls: stun.length ? stun : ["stun:stun.l.google.com:19302"] }];
   const turn = listar(process.env.TURN_URL);
-  if (turn.length) lista.push({ urls: turn, username: process.env.TURN_USER || "", credential: process.env.TURN_PASS || "" });
-  return lista;
+  if (turn.length) ent.push({ urls: turn, username: process.env.TURN_USER || "", credential: process.env.TURN_PASS || "" });
+  return expandirIce(ent);
 }
-function rtcConfig() { const c = { iceServers: iceServers() }; if (FORCE_RELAY) c.iceTransportPolicy = "relay"; return c; }
+
+// Cloudflare Realtime TURN: gera credenciais EFÊMERAS via API (TURN_KEY_ID + TURN_API_TOKEN).
+// Cacheia por ~50 min (TTL 1h) para não chamar a API a cada ligação. Sem as chaves, cai no ICE
+// estático (env) ou no STUN público. Nunca lança — falha vira fallback.
+let _iceCache = null, _iceCacheExp = 0;
+async function gerarIceServers() {
+  const keyId = process.env.TURN_KEY_ID, apiToken = process.env.TURN_API_TOKEN;
+  if (!keyId || !apiToken) return iceServers();
+  if (_iceCache && Date.now() < _iceCacheExp) return _iceCache;
+  try {
+    const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate-ice-servers`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ttl: 3600 }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.iceServers) {
+      _iceCache = expandirIce(j.iceServers);
+      _iceCacheExp = Date.now() + 50 * 60 * 1000;
+      return _iceCache;
+    }
+    console.error("[voz] Cloudflare TURN falhou:", r.status, JSON.stringify(j?.errors || j).slice(0, 200));
+  } catch (e) { console.error("[voz] erro ao gerar TURN Cloudflare:", e?.message || e); }
+  return iceServers(); // fallback
+}
+function rtcConfig(ice) { const c = { iceServers: ice || iceServers() }; if (FORCE_RELAY) c.iceTransportPolicy = "relay"; return c; }
 function setupAtivo(sdp) { return sdp.replace(/a=setup:actpass/g, "a=setup:active").replace(/a=setup:passive/g, "a=setup:active"); }
 
 async function metaCalls(phoneId, body) {
@@ -190,8 +231,11 @@ app.post("/chamada", async (req, res) => {
   }
 
   c.tocandoPara = new Set(alvo);
+  // gera as credenciais TURN uma vez para esta ligação e envia ao navegador (ele precisa do MESMO
+  // relay para conectar); o servidor reusa em `atender`. Os dois lados com relay = conexão garantida.
+  c.iceServers = await gerarIceServers();
   console.log(`[voz] chamada ${call_id} de ${c.nome}: tocando p/ ${alvo.length} operador(es) [${modo}]`);
-  for (const op of alvo) { try { op.send(JSON.stringify({ tipo: "chamada_recebida", call_id, from, nome: c.nome, conversa_id, departamento_id })); } catch {} }
+  for (const op of alvo) { try { op.send(JSON.stringify({ tipo: "chamada_recebida", call_id, from, nome: c.nome, conversa_id, departamento_id, iceServers: c.iceServers })); } catch {} }
   // 30s sem atender -> perdida (encerra e some da UI)
   c.timer = setTimeout(() => {
     if (c.estado !== "tocando") return;
@@ -272,8 +316,9 @@ async function atender(ws, call_id, browserOffer) {
   console.log(`[voz] chamada ${call_id} atendida por "${ws._info?.nome}"`);
 
   try {
-    const metaPc = new RTCPeerConnection(rtcConfig());
-    const operatorPc = new RTCPeerConnection(rtcConfig());
+    const ice = c.iceServers || await gerarIceServers();
+    const metaPc = new RTCPeerConnection(rtcConfig(ice));
+    const operatorPc = new RTCPeerConnection(rtcConfig(ice));
     c.metaPc = metaPc; c.operatorPc = operatorPc;
 
     const paraMeta = new MediaStreamTrack({ kind: "audio" });      // voz do operador -> cliente
