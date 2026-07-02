@@ -293,6 +293,7 @@ wss.on("connection", (ws) => {
     }
     // presença informada pelo painel (online/ausente). Ausente -> não recebe novas ligações.
     if (m.tipo === "presenca") { ws._presenca = (m.status === "ausente") ? "ausente" : "online"; return; }
+    if (m.tipo === "assumir") return assumir(ws, m.call_id);
     if (m.tipo === "atender") return atender(ws, m.call_id, m.sdp);
     if (m.tipo === "desligar") return desligar(m.call_id, "operador");
     if (m.tipo === "recusar") return recusar(ws, m.call_id);
@@ -304,15 +305,34 @@ wss.on("connection", (ws) => {
   });
 });
 
-async function atender(ws, call_id, browserOffer) {
+// RESERVA a chamada no CLIQUE do operador (antes de o navegador coletar mídia/ICE, que leva
+// segundos). Assim os outros operadores param de tocar IMEDIATAMENTE e não atendem uma ligação
+// já pega. O SDP vem depois, no "atender". Se já foi pega, responde "indisponível" na hora.
+function assumir(ws, call_id) {
   const c = chamadas.get(call_id);
   if (!c || c.estado !== "tocando") { try { ws.send(JSON.stringify({ tipo: "chamada_indisponivel", call_id })); } catch {} return; }
   c.estado = "atendida"; c.operadorWs = ws; c.operadorId = ws._info?.operador_id || null;
   ws._emChamada = call_id; // ocupado: não recebe toque de novas ligações
   clearTimeout(c.timer);
+  avisarOperadores(ws, { tipo: "chamada_assumida", call_id });
+  console.log(`[voz] chamada ${call_id} RESERVADA por "${ws._info?.nome}" (aguardando SDP)`);
+}
+
+async function atender(ws, call_id, browserOffer) {
+  const c = chamadas.get(call_id);
+  if (!c) { try { ws.send(JSON.stringify({ tipo: "chamada_indisponivel", call_id })); } catch {} return; }
+  // fluxo normal: a chamada já foi RESERVADA por este operador no "assumir". Compatibilidade:
+  // se ainda estiver "tocando" (painel antigo, sem reserva prévia), reserva agora.
+  if (c.estado === "tocando") {
+    c.estado = "atendida"; c.operadorWs = ws; c.operadorId = ws._info?.operador_id || null;
+    ws._emChamada = call_id;
+    clearTimeout(c.timer);
+    avisarOperadores(ws, { tipo: "chamada_assumida", call_id });
+  } else if (!(c.estado === "atendida" && c.operadorWs === ws)) {
+    try { ws.send(JSON.stringify({ tipo: "chamada_indisponivel", call_id })); } catch {} return; // já é de outro operador
+  }
   // aviso de gravação ao cliente (LGPD) — a gravação em si é feita no navegador do operador
   if (c.mensagemGravacao && c.from) metaMessages(c.phoneId, c.from, c.mensagemGravacao).catch(() => {});
-  avisarOperadores(ws, { tipo: "chamada_assumida", call_id });
   console.log(`[voz] chamada ${call_id} atendida por "${ws._info?.nome}"`);
 
   try {
