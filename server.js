@@ -36,6 +36,9 @@ if (!process.env.VOZ_SECRET) {
 if (!process.env.CONVERSAS_URL) {
   console.warn("[voz] AVISO: CONVERSAS_URL não definido — eventos (atendida/encerrada) não serão reportados ao Conversas.");
 }
+if (!process.env.TURN_URL) {
+  console.warn("[voz] AVISO: TURN_URL não definido — sem servidor TURN, a perna navegador↔voz depende de conexão direta (STUN) e pode NÃO conectar atrás de NAT/firewall (o operador não ouve / não é ouvido). Configure TURN_URL/TURN_USER/TURN_PASS para áudio confiável.");
+}
 
 // comparação de segredo em tempo constante (evita timing attack no x-voz-secret)
 function segredoOk(req) {
@@ -48,8 +51,13 @@ process.on("uncaughtException", (e) => console.error("[voz] uncaughtException:",
 process.on("unhandledRejection", (e) => console.error("[voz] unhandledRejection:", e?.message || e));
 
 function iceServers() {
-  const lista = [{ urls: process.env.STUN_URL || "stun:stun.l.google.com:19302" }];
-  if (process.env.TURN_URL) lista.push({ urls: process.env.TURN_URL, username: process.env.TURN_USER || "", credential: process.env.TURN_PASS || "" });
+  // STUN e TURN aceitam MÚLTIPLAS URLs separadas por vírgula (ex.: TURN em 3478 UDP, 443 TCP e
+  // TLS) — quanto mais transportes, maior a chance de conectar em qualquer rede/firewall.
+  const listar = (v) => String(v || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const stun = listar(process.env.STUN_URL);
+  const lista = [{ urls: stun.length ? stun : ["stun:stun.l.google.com:19302"] }];
+  const turn = listar(process.env.TURN_URL);
+  if (turn.length) lista.push({ urls: turn, username: process.env.TURN_USER || "", credential: process.env.TURN_PASS || "" });
   return lista;
 }
 function rtcConfig() { const c = { iceServers: iceServers() }; if (FORCE_RELAY) c.iceTransportPolicy = "relay"; return c; }
