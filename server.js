@@ -361,16 +361,31 @@ app.post("/chamada-resposta", async (req, res) => {
   if (c.estado !== "chamando") return;
   try {
     await c.metaPc.setRemoteDescription({ type: "answer", sdp });
-    c.estado = "atendida"; c.iniciada = Date.now();
+    // O "answer" da Meta apenas ESTABELECE a sessão de mídia (o telefone do cliente começa a
+    // tocar) — NÃO é o cliente atendendo (isso vem dezenas de segundos depois). Portanto NÃO
+    // marcamos "atendida" aqui: seguimos em "conectando" e o painel continua tocando o ringback.
+    // O "atendida" real é disparado quando chega o 1º áudio do cliente (ver marcarAtendidaSaida).
+    c.estado = "conectando";
     clearTimeout(c.timer);
-    if (c.operadorWs?.readyState === 1) try { c.operadorWs.send(JSON.stringify({ tipo: "atendida", call_id })); } catch {}
-    reportarEvento("atendida", c);
-    console.log(`[voz][saida] ${call_id} atendida pelo cliente`);
+    // se o cliente não atender em 60s após a sessão pronta, desiste
+    c.timer = setTimeout(() => { if (c.estado !== "atendida") { console.log(`[voz][saida] ${call_id} não atendida (timeout pós-sessão)`); desligar(call_id, "nao_atendida"); } }, 60000);
+    console.log(`[voz][saida] ${call_id} sessão de mídia pronta — tocando, aguardando o cliente atender`);
   } catch (e) {
     console.error(`[voz][saida] erro ao aplicar resposta ${call_id}:`, e?.message || e);
     desligar(call_id, "erro_resposta");
   }
 });
+
+// marca a ligação de SAÍDA como atendida NO MOMENTO em que o cliente realmente atende (1º áudio
+// dele). Só então paramos o ringback do operador, começamos o cronômetro e o registro de duração.
+function marcarAtendidaSaida(c) {
+  if (!c || c.estado === "atendida") return;
+  c.estado = "atendida"; c.iniciada = Date.now();
+  clearTimeout(c.timer);
+  if (c.operadorWs?.readyState === 1) try { c.operadorWs.send(JSON.stringify({ tipo: "atendida", call_id: c.call_id })); } catch {}
+  reportarEvento("atendida", c);
+  console.log(`[voz][saida] ${c.call_id} cliente ATENDEU (1º áudio) — ${c.placedAt ? Math.round((Date.now() - c.placedAt) / 1000) + "s de toque" : "?"}`);
+}
 
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer });
@@ -524,7 +539,7 @@ async function ligarSaida(ws, m) {
   if (!to || !browserOffer) { try { ws.send(JSON.stringify({ tipo: "erro", msg: "ligar sem número/sdp" })); } catch {} return; }
   if (ws._emChamada) { try { ws.send(JSON.stringify({ tipo: "erro", msg: "você já está em uma chamada" })); } catch {} return; }
   const phoneId = m.phone_number_id || process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const c = { call_id: null, from: to, nome: m.nome || to, conversa_id: m.conversa_id || null, departamento_id: m.departamento_id || null, operadorWs: ws, operadorId: ws._info?.operador_id || null, phoneId, estado: "chamando", metaPc: null, operatorPc: null, iniciada: 0, timer: null, saida: true };
+  const c = { call_id: null, from: to, nome: m.nome || to, conversa_id: m.conversa_id || null, departamento_id: m.departamento_id || null, operadorWs: ws, operadorId: ws._info?.operador_id || null, phoneId, estado: "chamando", metaPc: null, operatorPc: null, iniciada: 0, timer: null, saida: true, placedAt: Date.now() };
   try {
     const ice = await gerarIceServers();
     const metaPc = new RTCPeerConnection(rtcConfig(ice));
@@ -539,7 +554,14 @@ async function ligarSaida(ws, m) {
     metaPc.onTrack.subscribe((tr) => {
       const t = tr?.onReceiveRtp ? tr : tr?.track;
       if (!t?.onReceiveRtp) return;
-      t.onReceiveRtp.subscribe((rtp) => { try { paraOperador.writeRtp(rtp); } catch (e) { if (!falhouParaOperador) { falhouParaOperador = true; console.log(`[voz][meta ${c.call_id}] writeRtp->operador falhou:`, e?.message); } } c.gravador?.onRtp("cliente", rtp); });
+      t.onReceiveRtp.subscribe((rtp) => {
+        // 1º áudio REAL do cliente = ele ATENDEU de verdade. O evento "connect"/answer da Meta
+        // vem ~dezenas de segundos antes (só estabelece a sessão; o telefone ainda está tocando),
+        // então é AQUI — não no answer — que paramos o ringback no painel e marcamos "atendida".
+        if (c.saida && c.estado !== "atendida") marcarAtendidaSaida(c);
+        try { paraOperador.writeRtp(rtp); } catch (e) { if (!falhouParaOperador) { falhouParaOperador = true; console.log(`[voz][meta ${c.call_id}] writeRtp->operador falhou:`, e?.message); } }
+        c.gravador?.onRtp("cliente", rtp);
+      });
     });
     operatorPc.onTrack.subscribe((tr) => {
       const t = tr?.onReceiveRtp ? tr : tr?.track;
