@@ -266,6 +266,28 @@ app.post("/chamada-fim", (req, res) => {
   console.log(`[voz] chamada ${call_id} encerrada pelo cliente`);
 });
 
+// resposta do cliente à ligação de SAÍDA (SDP answer), roteada pelo Conversas a partir
+// do webhook da Meta. Completa a perna da Meta -> o áudio começa a fluir.
+app.post("/chamada-resposta", async (req, res) => {
+  if (!segredoOk(req)) return res.status(403).json({ erro: "secret" });
+  const { call_id, sdp } = req.body || {};
+  res.json({ ok: true });
+  const c = chamadas.get(call_id);
+  if (!c || !c.saida || !c.metaPc) { console.log(`[voz][saida] resposta p/ chamada desconhecida ${call_id}`); return; }
+  if (c.estado !== "chamando") return;
+  try {
+    await c.metaPc.setRemoteDescription({ type: "answer", sdp });
+    c.estado = "atendida"; c.iniciada = Date.now();
+    clearTimeout(c.timer);
+    if (c.operadorWs?.readyState === 1) try { c.operadorWs.send(JSON.stringify({ tipo: "atendida", call_id })); } catch {}
+    reportarEvento("atendida", c);
+    console.log(`[voz][saida] ${call_id} atendida pelo cliente`);
+  } catch (e) {
+    console.error(`[voz][saida] erro ao aplicar resposta ${call_id}:`, e?.message || e);
+    desligar(call_id, "erro_resposta");
+  }
+});
+
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -295,6 +317,8 @@ wss.on("connection", (ws) => {
     if (m.tipo === "presenca") { ws._presenca = (m.status === "ausente") ? "ausente" : "online"; return; }
     if (m.tipo === "assumir") return assumir(ws, m.call_id);
     if (m.tipo === "atender") return atender(ws, m.call_id, m.sdp);
+    if (m.tipo === "ice") { const ice = await gerarIceServers(); try { ws.send(JSON.stringify({ tipo: "ice", iceServers: ice })); } catch {} return; } // TURN p/ o navegador montar a oferta de SAÍDA
+    if (m.tipo === "ligar") return ligarSaida(ws, m);  // chamada de SAÍDA (empresa -> cliente)
     if (m.tipo === "desligar") return desligar(m.call_id, "operador");
     if (m.tipo === "recusar") return recusar(ws, m.call_id);
   });
@@ -385,6 +409,87 @@ async function atender(ws, call_id, browserOffer) {
   } catch (e) {
     console.error(`[voz] erro ao atender ${call_id}:`, e?.message || e);
     desligar(call_id, "erro");
+  }
+}
+
+// Reporta ao Conversas que uma chamada de SAÍDA foi originada (cria o registro e
+// habilita o roteamento da RESPOSTA SDP de volta para cá pelo webhook da Meta).
+async function registrarSaidaConversas(c) {
+  const base = process.env.CONVERSAS_URL;
+  if (!base) return;
+  try {
+    await fetch(base.replace(/\/+$/, "") + "/voz/chamada-saida", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-voz-secret": process.env.VOZ_SECRET },
+      body: JSON.stringify({ call_id: c.call_id, conversa_id: c.conversa_id, departamento_id: c.departamento_id, to: c.from, operador_id: c.operadorId, nome: c.nome }),
+    });
+  } catch (e) { console.error("[voz] falha registrarSaidaConversas:", e.message); }
+}
+
+// CHAMADA DE SAÍDA (empresa -> cliente). O navegador do operador é o offerer da perna
+// dele (como no "atender"); o valcar-voz é o OFFERER da perna da Meta (createOffer +
+// action:"connect"). A resposta SDP do cliente chega pelo webhook do Conversas e é
+// aplicada em /chamada-resposta. Requer permissão de chamada já concedida (senão a Meta
+// recusa com 138006).
+async function ligarSaida(ws, m) {
+  const to = String(m.to || "").replace(/\D/g, "");
+  const browserOffer = m.sdp;
+  if (!to || !browserOffer) { try { ws.send(JSON.stringify({ tipo: "erro", msg: "ligar sem número/sdp" })); } catch {} return; }
+  if (ws._emChamada) { try { ws.send(JSON.stringify({ tipo: "erro", msg: "você já está em uma chamada" })); } catch {} return; }
+  const phoneId = m.phone_number_id || process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const c = { call_id: null, from: to, nome: m.nome || to, conversa_id: m.conversa_id || null, departamento_id: m.departamento_id || null, operadorWs: ws, operadorId: ws._info?.operador_id || null, phoneId, estado: "chamando", metaPc: null, operatorPc: null, iniciada: 0, timer: null, saida: true };
+  try {
+    const ice = await gerarIceServers();
+    const metaPc = new RTCPeerConnection(rtcConfig(ice));
+    const operatorPc = new RTCPeerConnection(rtcConfig(ice));
+    c.metaPc = metaPc; c.operatorPc = operatorPc;
+    const paraMeta = new MediaStreamTrack({ kind: "audio" });      // voz do operador -> cliente
+    const paraOperador = new MediaStreamTrack({ kind: "audio" });  // voz do cliente -> operador
+    metaPc.addTransceiver(paraMeta, { direction: "sendrecv" });
+    operatorPc.addTransceiver(paraOperador, { direction: "sendrecv" });
+    let falhouParaOperador = false, falhouParaMeta = false;
+    metaPc.onTrack.subscribe((tr) => {
+      const t = tr?.onReceiveRtp ? tr : tr?.track;
+      if (!t?.onReceiveRtp) return;
+      t.onReceiveRtp.subscribe((rtp) => { try { paraOperador.writeRtp(rtp); } catch (e) { if (!falhouParaOperador) { falhouParaOperador = true; console.log(`[voz][meta ${c.call_id}] writeRtp->operador falhou:`, e?.message); } } });
+    });
+    operatorPc.onTrack.subscribe((tr) => {
+      const t = tr?.onReceiveRtp ? tr : tr?.track;
+      if (!t?.onReceiveRtp) return;
+      t.onReceiveRtp.subscribe((rtp) => { try { paraMeta.writeRtp(rtp); } catch (e) { if (!falhouParaMeta) { falhouParaMeta = true; console.log(`[voz][op ${c.call_id}] writeRtp->cliente falhou:`, e?.message); } } });
+    });
+    metaPc.connectionStateChange.subscribe((s) => { if (s === "failed" || s === "disconnected") console.log(`[voz][meta ${c.call_id}] pc: ${s}`); });
+    operatorPc.connectionStateChange.subscribe((s) => { if (s === "failed" || s === "disconnected") console.log(`[voz][op ${c.call_id}] pc: ${s}`); });
+
+    // perna do operador (navegador é offerer): responde
+    await operatorPc.setRemoteDescription({ type: "offer", sdp: browserOffer });
+    const oAns = await operatorPc.createAnswer(); await operatorPc.setLocalDescription(oAns);
+    try { ws.send(JSON.stringify({ tipo: "resposta", call_id: null, sdp: operatorPc.localDescription.sdp })); } catch {}
+
+    // perna da Meta: valcar-voz é o OFFERER -> action:"connect"
+    const off = await metaPc.createOffer(); await metaPc.setLocalDescription(off);
+    const sess = { sdp_type: "offer", sdp: metaPc.localDescription.sdp };
+    const r = await metaCalls(phoneId, { messaging_product: "whatsapp", to, action: "connect", session: sess });
+    const callId = r.json?.calls?.[0]?.id || r.json?.messages?.[0]?.id || r.json?.id || null;
+    console.log(`[voz][saida] connect p/ ${to}:`, r.status, callId ? "call " + callId : JSON.stringify(r.json).slice(0, 220));
+    if (!r.ok || !callId) {
+      try { ws.send(JSON.stringify({ tipo: "erro", msg: r.json?.error?.message || "A Meta recusou a ligação (sem permissão de chamada?)" })); } catch {}
+      try { metaPc.close?.(); operatorPc.close?.(); } catch {}
+      return;
+    }
+    c.call_id = callId;
+    ws._emChamada = callId;
+    chamadas.set(callId, c);
+    try { ws.send(JSON.stringify({ tipo: "chamando", call_id: callId, to, nome: c.nome })); } catch {}
+    registrarSaidaConversas(c);
+    // 45s sem o cliente atender -> desiste
+    c.timer = setTimeout(() => { if (c.estado === "chamando") { console.log(`[voz][saida] ${callId} não atendida (timeout)`); desligar(callId, "nao_atendida"); } }, 45000);
+  } catch (e) {
+    console.error("[voz][saida] erro ao ligar:", e?.message || e);
+    try { ws.send(JSON.stringify({ tipo: "erro", msg: "falha ao originar a ligação" })); } catch {}
+    try { c.metaPc?.close?.(); c.operatorPc?.close?.(); } catch {}
+    if (c.call_id) { chamadas.delete(c.call_id); }
+    ws._emChamada = null;
   }
 }
 
