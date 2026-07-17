@@ -21,7 +21,15 @@ import express from "express";
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
 import crypto from "crypto";
+import { createRequire } from "module";
 import { RTCPeerConnection, MediaStreamTrack } from "werift";
+
+// Decoder Opus (puro-JS, sem build nativo) para a GRAVAÇÃO no servidor. Se ausente,
+// a gravação server-side fica desabilitada (o fallback do navegador continua valendo).
+const require = createRequire(import.meta.url);
+let OpusScript = null;
+try { OpusScript = require("opusscript"); }
+catch (e) { console.warn("[voz] opusscript ausente — gravação no servidor desabilitada:", e?.message); }
 
 const PORT = process.env.PORT || 8080;
 const GRAPH_VERSION = process.env.GRAPH_VERSION || "v21.0";
@@ -156,6 +164,81 @@ async function reportarEvento(tipo, c, extra) {
   } catch (e) { console.error("[voz] falha reportarEvento:", e.message); }
 }
 
+// ============================================================
+// GRAVAÇÃO NO SERVIDOR: decodifica o Opus das duas pernas (cliente + operador),
+// posiciona cada frame pelo timestamp RTP (48kHz) num buffer de saída de 8kHz,
+// e ao final mixa tudo num WAV mono. Não depende do navegador do operador.
+// ============================================================
+const TAXA_GRAV = 8000; // Hz de saída (qualidade telefone, suficiente para revisão de voz)
+
+function wavDe(int16, taxa) {
+  const nBytes = int16.length * 2;
+  const buf = Buffer.alloc(44 + nBytes);
+  buf.write("RIFF", 0); buf.writeUInt32LE(36 + nBytes, 4); buf.write("WAVE", 8);
+  buf.write("fmt ", 12); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(taxa, 24); buf.writeUInt32LE(taxa * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34);
+  buf.write("data", 36); buf.writeUInt32LE(nBytes, 40);
+  for (let i = 0; i < int16.length; i++) buf.writeInt16LE(int16[i], 44 + i * 2);
+  return buf;
+}
+
+function criarGravador() {
+  if (!OpusScript) return null;
+  let dec;
+  try { dec = { cliente: new OpusScript(TAXA_GRAV, 1), operador: new OpusScript(TAXA_GRAV, 1) }; }
+  catch (e) { console.warn("[voz] falha ao criar decoder Opus:", e?.message); return null; }
+  const legs = { cliente: { first: null, wall: 0 }, operador: { first: null, wall: 0 } };
+  let bufs = { cliente: new Int16Array(TAXA_GRAV * 30), operador: new Int16Array(TAXA_GRAV * 30) };
+  const len = { cliente: 0, operador: 0 };
+  let recStart = 0;
+  function garantir(p, ate) { if (ate <= bufs[p].length) return; let n = bufs[p].length; while (n < ate) n *= 2; const novo = new Int16Array(n); novo.set(bufs[p]); bufs[p] = novo; }
+  function onRtp(perna, rtp) {
+    try {
+      const payload = rtp?.payload; const ts = rtp?.header?.timestamp;
+      if (!payload || !payload.length || ts == null) return;
+      const leg = legs[perna]; const now = Date.now(); const t = ts >>> 0;
+      if (leg.first == null) { leg.first = t; leg.wall = now; if (!recStart) recStart = now; }
+      let pcm; try { pcm = dec[perna].decode(payload); } catch { return; }
+      if (!pcm || !pcm.length) return;
+      const nSamp = pcm.length >> 1;
+      const posLeg = Math.round((t - leg.first) / 6); // 48kHz RTP -> 8kHz saída
+      const off = Math.round((leg.wall - recStart) / 1000 * TAXA_GRAV);
+      let idx = off + posLeg; if (idx < 0) idx = 0;
+      garantir(perna, idx + nSamp);
+      for (let i = 0; i < nSamp; i++) bufs[perna][idx + i] = pcm.readInt16LE(i << 1);
+      if (idx + nSamp > len[perna]) len[perna] = idx + nSamp;
+    } catch {}
+  }
+  function finalizar() {
+    const total = Math.max(len.cliente, len.operador);
+    try { dec.cliente.delete?.(); dec.operador.delete?.(); } catch {}
+    if (!total) return null;
+    const mix = new Int16Array(total);
+    for (let i = 0; i < total; i++) {
+      let s = (i < len.cliente ? bufs.cliente[i] : 0) + (i < len.operador ? bufs.operador[i] : 0);
+      if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+      mix[i] = s;
+    }
+    bufs = null;
+    return wavDe(mix, TAXA_GRAV);
+  }
+  return { onRtp, finalizar };
+}
+
+// envia a gravação (WAV) ao Conversas (server-to-server, x-voz-secret). Dedupe é no Conversas.
+async function enviarGravacao(callId, wavBuf) {
+  const base = process.env.CONVERSAS_URL;
+  if (!base || !wavBuf) return;
+  try {
+    await fetch(base.replace(/\/+$/, "") + "/voz/gravacao", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-voz-secret": process.env.VOZ_SECRET },
+      body: JSON.stringify({ call_id: callId, mime: "audio/wav", base64: wavBuf.toString("base64") }),
+    });
+    console.log(`[voz] gravação enviada (${callId}); ${Math.round(wavBuf.length / 1024)}KB`);
+  } catch (e) { console.error("[voz] falha ao enviar gravação:", e.message); }
+}
+
 // ---- estado ----
 const operadores = new Set(); // ws (cada um com ws._info = {nome, departamentos:[], operador_id})
 const chamadas = new Map();    // call_id -> { estado, offerSdp, phoneId, metaPc, operatorPc, operadorWs, ... }
@@ -257,6 +340,7 @@ app.post("/chamada-fim", (req, res) => {
   const tocando = c.estado === "tocando";
   c.estado = "encerrada";
   if (c.operadorWs) c.operadorWs._emChamada = null; // libera o operador
+  try { const wav = c.gravador?.finalizar?.(); c.gravador = null; if (wav) enviarGravacao(call_id, wav); } catch (e) { console.error("[voz] erro ao finalizar gravação:", e?.message); }
   try { c.metaPc?.close?.(); } catch {}
   try { c.operatorPc?.close?.(); } catch {}
   if (c.operadorWs?.readyState === 1) try { c.operadorWs.send(JSON.stringify({ tipo: "encerrada", call_id, motivo: "cliente" })); } catch {}
@@ -364,6 +448,7 @@ async function atender(ws, call_id, browserOffer) {
     const metaPc = new RTCPeerConnection(rtcConfig(ice));
     const operatorPc = new RTCPeerConnection(rtcConfig(ice));
     c.metaPc = metaPc; c.operatorPc = operatorPc;
+    c.gravador = criarGravador(); // grava a chamada no servidor (independe do navegador)
 
     const paraMeta = new MediaStreamTrack({ kind: "audio" });      // voz do operador -> cliente
     const paraOperador = new MediaStreamTrack({ kind: "audio" });  // voz do cliente -> operador
@@ -378,6 +463,7 @@ async function atender(ws, call_id, browserOffer) {
       if (!t?.onReceiveRtp) { console.log(`[voz][meta ${call_id}] onTrack sem onReceiveRtp — cliente->operador não liga`); return; }
       t.onReceiveRtp.subscribe((rtp) => {
         try { paraOperador.writeRtp(rtp); } catch (e) { if (!falhouParaOperador) { falhouParaOperador = true; console.log(`[voz][meta ${call_id}] writeRtp->operador falhou:`, e?.message); } }
+        c.gravador?.onRtp("cliente", rtp);
       });
     });
     operatorPc.onTrack.subscribe((tr) => {
@@ -385,6 +471,7 @@ async function atender(ws, call_id, browserOffer) {
       if (!t?.onReceiveRtp) { console.log(`[voz][op ${call_id}] onTrack sem onReceiveRtp — operador->cliente não liga`); return; }
       t.onReceiveRtp.subscribe((rtp) => {
         try { paraMeta.writeRtp(rtp); } catch (e) { if (!falhouParaMeta) { falhouParaMeta = true; console.log(`[voz][op ${call_id}] writeRtp->cliente falhou:`, e?.message); } }
+        c.gravador?.onRtp("operador", rtp);
       });
     });
     // estado da conexão só quando FALHA (o caso que interessa depurar); "connected" não polui o log
@@ -443,6 +530,7 @@ async function ligarSaida(ws, m) {
     const metaPc = new RTCPeerConnection(rtcConfig(ice));
     const operatorPc = new RTCPeerConnection(rtcConfig(ice));
     c.metaPc = metaPc; c.operatorPc = operatorPc;
+    c.gravador = criarGravador(); // grava a chamada no servidor (independe do navegador)
     const paraMeta = new MediaStreamTrack({ kind: "audio" });      // voz do operador -> cliente
     const paraOperador = new MediaStreamTrack({ kind: "audio" });  // voz do cliente -> operador
     metaPc.addTransceiver(paraMeta, { direction: "sendrecv" });
@@ -451,12 +539,12 @@ async function ligarSaida(ws, m) {
     metaPc.onTrack.subscribe((tr) => {
       const t = tr?.onReceiveRtp ? tr : tr?.track;
       if (!t?.onReceiveRtp) return;
-      t.onReceiveRtp.subscribe((rtp) => { try { paraOperador.writeRtp(rtp); } catch (e) { if (!falhouParaOperador) { falhouParaOperador = true; console.log(`[voz][meta ${c.call_id}] writeRtp->operador falhou:`, e?.message); } } });
+      t.onReceiveRtp.subscribe((rtp) => { try { paraOperador.writeRtp(rtp); } catch (e) { if (!falhouParaOperador) { falhouParaOperador = true; console.log(`[voz][meta ${c.call_id}] writeRtp->operador falhou:`, e?.message); } } c.gravador?.onRtp("cliente", rtp); });
     });
     operatorPc.onTrack.subscribe((tr) => {
       const t = tr?.onReceiveRtp ? tr : tr?.track;
       if (!t?.onReceiveRtp) return;
-      t.onReceiveRtp.subscribe((rtp) => { try { paraMeta.writeRtp(rtp); } catch (e) { if (!falhouParaMeta) { falhouParaMeta = true; console.log(`[voz][op ${c.call_id}] writeRtp->cliente falhou:`, e?.message); } } });
+      t.onReceiveRtp.subscribe((rtp) => { try { paraMeta.writeRtp(rtp); } catch (e) { if (!falhouParaMeta) { falhouParaMeta = true; console.log(`[voz][op ${c.call_id}] writeRtp->cliente falhou:`, e?.message); } } c.gravador?.onRtp("operador", rtp); });
     });
     metaPc.connectionStateChange.subscribe((s) => { if (s === "failed" || s === "disconnected") console.log(`[voz][meta ${c.call_id}] pc: ${s}`); });
     operatorPc.connectionStateChange.subscribe((s) => { if (s === "failed" || s === "disconnected") console.log(`[voz][op ${c.call_id}] pc: ${s}`); });
@@ -499,6 +587,8 @@ function desligar(call_id, motivo) {
   c.estado = "encerrada";
   if (c.operadorWs) c.operadorWs._emChamada = null; // libera o operador
   metaCalls(c.phoneId, { messaging_product: "whatsapp", call_id, action: "terminate" }).catch(() => {});
+  // fecha a gravação do servidor e envia (só se houve áudio); dedupe é no Conversas
+  try { const wav = c.gravador?.finalizar?.(); c.gravador = null; if (wav) enviarGravacao(call_id, wav); } catch (e) { console.error("[voz] erro ao finalizar gravação:", e?.message); }
   try { c.metaPc?.close?.(); } catch {}
   try { c.operatorPc?.close?.(); } catch {}
   if (c.operadorWs?.readyState === 1) try { c.operadorWs.send(JSON.stringify({ tipo: "encerrada", call_id, motivo })); } catch {}
