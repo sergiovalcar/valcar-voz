@@ -1,9 +1,9 @@
 {
-  "name": "valcar-voz-spike",
+  "name": "voz-conversas",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Spike de infra (Fase 2 voz): testa se o WebRTC/ICE (UDP) chega ao contêiner do Railway. DataChannel echo via werift.",
+  "description": "Serviço de voz do Conversas (ligações WhatsApp via WebRTC) — white-label, configurado por variáveis de ambiente.",
   "engines": { "node": ">=18" },
   "scripts": { "start": "node server.js" },
   "dependencies": {

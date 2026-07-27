@@ -647,7 +647,7 @@ httpServer.listen(PORT, () => {
 // ------------------------------------------------------------
 const PAGINA_OPERADOR = '<!doctype html>'
 + '<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
-+ '<title>valcar-voz — operador (teste)</title><style>'
++ '<title>Voz — operador (teste)</title><style>'
 + 'body{font-family:system-ui,Segoe UI,Roboto,sans-serif;max-width:560px;margin:24px auto;padding:0 16px;color:#1d1d1f}'
 + 'h1{font-size:19px}button{font-size:15px;font-weight:600;border:0;border-radius:10px;padding:10px 16px;cursor:pointer}'
 + '.vermelho{background:#EB3237;color:#fff}.verde{background:#1a7f37;color:#fff}.cinza{background:#e5e5ea;color:#1d1d1f}'
