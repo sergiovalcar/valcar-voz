@@ -3,9 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Serviço de voz do Conversas (ligações WhatsApp via WebRTC) — white-label, configurado por variáveis de ambiente.",
-  "engines": { "node": ">=18" },
-  "scripts": { "start": "node server.js" },
+  "description": "Servi\u00e7o de voz do Conversas (liga\u00e7\u00f5es WhatsApp via WebRTC) \u2014 white-label, configurado por vari\u00e1veis de ambiente.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js",
+    "check": "node --check server.js && node --check copiloto.js && node --check mulaw.js"
+  },
   "dependencies": {
     "express": "^4.19.2",
     "opusscript": "^0.1.1",

@@ -14,7 +14,9 @@
 //  VOZ_SECRET (obrigatória — HMAC dos tickets + header x-voz-secret),
 //  CONVERSAS_URL (obrigatória p/ reportar eventos de volta ao Conversas),
 //  VOZ_DEV (=1 p/ liberar a tela de operador de teste),
-//  STUN_URL/TURN_URL/TURN_USER/TURN_PASS/FORCE_RELAY (opcionais)
+//  STUN_URL/TURN_URL/TURN_USER/TURN_PASS/FORCE_RELAY (opcionais),
+//  COPILOTO_WS_URL (opcional — liga o COPILOTO AO VIVO na ligação; a mesma URL
+//    usada pela Carteira. Sem ela, a ligação funciona igual, só sem instruções).
 // ============================================================
 
 import express from "express";
@@ -23,6 +25,7 @@ import { createServer } from "http";
 import crypto from "crypto";
 import { createRequire } from "module";
 import { RTCPeerConnection, MediaStreamTrack } from "werift";
+import { abrirCopiloto } from "./copiloto.js";
 
 // Decoder Opus (puro-JS, sem build nativo) para a GRAVAÇÃO no servidor. Se ausente,
 // a gravação server-side fica desabilitada (o fallback do navegador continua valendo).
@@ -182,7 +185,28 @@ function wavDe(int16, taxa) {
   return buf;
 }
 
-function criarGravador() {
+// `aoDecodificar(perna, pcm)` (opcional) recebe o MESMO PCM16 8 kHz que a gravação
+// usa, logo após o decode do Opus. É por aqui que o copiloto ao vivo escuta a
+// ligação — sem decodificar de novo, que dobraria o custo de CPU por chamada.
+
+// Liga o copiloto ao vivo a uma chamada: cria a ponte, manda o PCM decodificado e
+// devolve as sugestões ao navegador do operador pelo WS que ele já tem aberto.
+// Best-effort: sem COPILOTO_WS_URL, ou em qualquer erro, a ligação segue igual.
+function ligarCopiloto(c, ws) {
+  try {
+    c.copiloto = abrirCopiloto({
+      callId: c.call_id,
+      finalidade: c.finalidade || "onboarding",
+      aoSugerir: (sug) => {
+        try { ws.send(JSON.stringify({ tipo: "copiloto", call_id: c.call_id, sugestao: sug })); } catch { /* ignora */ }
+      },
+    });
+    if (c.copiloto) console.log(`[voz] copiloto ao vivo ligado na chamada ${c.call_id}`);
+  } catch (e) { console.log("[voz] copiloto não ligou:", e?.message); c.copiloto = null; }
+  return (perna, pcm) => c.copiloto?.enviar(perna, pcm);
+}
+
+function criarGravador(aoDecodificar) {
   if (!OpusScript) return null;
   let dec;
   try { dec = { cliente: new OpusScript(TAXA_GRAV, 1), operador: new OpusScript(TAXA_GRAV, 1) }; }
@@ -200,6 +224,8 @@ function criarGravador() {
       if (leg.first == null) { leg.first = t; leg.wall = now; if (!recStart) recStart = now; }
       let pcm; try { pcm = dec[perna].decode(payload); } catch { return; }
       if (!pcm || !pcm.length) return;
+      // fork para o copiloto ao vivo — nunca pode interromper a gravação
+      if (aoDecodificar) { try { aoDecodificar(perna, pcm); } catch { /* ignora */ } }
       const nSamp = pcm.length >> 1;
       const posLeg = Math.round((t - leg.first) / 6); // 48kHz RTP -> 8kHz saída
       const off = Math.round((leg.wall - recStart) / 1000 * TAXA_GRAV);
@@ -340,6 +366,7 @@ app.post("/chamada-fim", (req, res) => {
   const tocando = c.estado === "tocando";
   c.estado = "encerrada";
   if (c.operadorWs) c.operadorWs._emChamada = null; // libera o operador
+  try { c.copiloto?.fechar?.(); c.copiloto = null; } catch { /* ignora */ }
   try { const wav = c.gravador?.finalizar?.(); c.gravador = null; if (wav) enviarGravacao(call_id, wav); } catch (e) { console.error("[voz] erro ao finalizar gravação:", e?.message); }
   try { c.metaPc?.close?.(); } catch {}
   try { c.operatorPc?.close?.(); } catch {}
@@ -463,7 +490,7 @@ async function atender(ws, call_id, browserOffer) {
     const metaPc = new RTCPeerConnection(rtcConfig(ice));
     const operatorPc = new RTCPeerConnection(rtcConfig(ice));
     c.metaPc = metaPc; c.operatorPc = operatorPc;
-    c.gravador = criarGravador(); // grava a chamada no servidor (independe do navegador)
+    c.gravador = criarGravador(ligarCopiloto(c, ws)); // grava no servidor + alimenta o copiloto ao vivo
 
     const paraMeta = new MediaStreamTrack({ kind: "audio" });      // voz do operador -> cliente
     const paraOperador = new MediaStreamTrack({ kind: "audio" });  // voz do cliente -> operador
@@ -545,7 +572,7 @@ async function ligarSaida(ws, m) {
     const metaPc = new RTCPeerConnection(rtcConfig(ice));
     const operatorPc = new RTCPeerConnection(rtcConfig(ice));
     c.metaPc = metaPc; c.operatorPc = operatorPc;
-    c.gravador = criarGravador(); // grava a chamada no servidor (independe do navegador)
+    c.gravador = criarGravador(ligarCopiloto(c, ws)); // grava no servidor + alimenta o copiloto ao vivo
     const paraMeta = new MediaStreamTrack({ kind: "audio" });      // voz do operador -> cliente
     const paraOperador = new MediaStreamTrack({ kind: "audio" });  // voz do cliente -> operador
     metaPc.addTransceiver(paraMeta, { direction: "sendrecv" });
@@ -610,6 +637,7 @@ function desligar(call_id, motivo) {
   if (c.operadorWs) c.operadorWs._emChamada = null; // libera o operador
   metaCalls(c.phoneId, { messaging_product: "whatsapp", call_id, action: "terminate" }).catch(() => {});
   // fecha a gravação do servidor e envia (só se houve áudio); dedupe é no Conversas
+  try { c.copiloto?.fechar?.(); c.copiloto = null; } catch { /* ignora */ }
   try { const wav = c.gravador?.finalizar?.(); c.gravador = null; if (wav) enviarGravacao(call_id, wav); } catch (e) { console.error("[voz] erro ao finalizar gravação:", e?.message); }
   try { c.metaPc?.close?.(); } catch {}
   try { c.operatorPc?.close?.(); } catch {}
