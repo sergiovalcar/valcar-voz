@@ -1,0 +1,41 @@
+# A ESTEIRA DA VOZ — e por que ela não existia.
+#
+# ⚠️ O REPOSITÓRIO SEMPRE TEVE TESTES (`test/mulaw.test.js`) e sempre teve `npm test`. O que
+# faltava era alguém RODÁ-LOS a cada envio. O preço apareceu do outro lado do sistema, em
+# 21/09: a auditoria independente recusou o PR #10 com *"repositório sem check obrigatório
+# verificado"* — ela não aprova o que não consegue conferir, e estava certa. Teste que existe
+# e não roda é a mesma coisa que teste nenhum, com o agravante de parecer cobertura.
+#
+# ⚠️ E O `push` COBRE SÓ A BRANCH DE INTEGRAÇÃO, de propósito. Com `branches: ["**"]` — que é
+# como os repositórios irmãos estão hoje — todo envio numa branch de PR paga DUAS corridas: a
+# do `push` e a do `pull_request`. Nada fica vermelho, nada parece errado, só a conta do mês.
+# A esteira nova não nasce com o defeito que o irmão já está consertando.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # ⚠️ O NOME DO JOB É `test` PORQUE ELE É O CONTRATO. O registro do auditor nomeia o check
+  # obrigatório de cada repositório, e os três irmãos usam `test`. Um nome diferente aqui
+  # obrigaria o registro a carregar uma exceção — lista à mão que envelhece na primeira vez
+  # que alguém renomear o job e esquecer do outro lado.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # ⚠️ SEM `cache: npm` E SEM `npm ci`: este repositório NÃO TEM `package-lock.json`, e os
+      # dois exigem o arquivo — a corrida quebraria na primeira linha, por um motivo que não
+      # tem nada a ver com o código enviado. `npm install` é o que funciona com o que existe
+      # hoje; no dia em que o lock entrar, os dois voltam e ficam mais rápidos e mais firmes.
+      - run: npm install
+      - name: Checagem de sintaxe
+        run: npm run check
+      - name: Testes
+        run: npm test
