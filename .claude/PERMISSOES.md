@@ -16,10 +16,17 @@ falha na classe vizinha. **A única trava que não depende da ordem dos argument
 operação não estar em `allow`.**
 
 Por isso `Bash(git *)` saiu. `git` entra por subcomando, e só os que **não têm flag
-destrutiva possível**: status, log, show, diff, add, commit, fetch, rev-parse, ls-files,
+destrutiva possível**: status, log, show, diff, add, commit, rev-parse, ls-files,
 merge-base, blame. `checkout`, `switch`, `restore` e `stash` saíram junto com push, reset,
 clean e rebase — `git checkout -f HEAD` descarta alteração não salva e `git stash clear`
 apaga o que estava guardado, e nenhuma regra de prefixo separa essas formas das inofensivas.
+
+**⚠️ `git fetch` PARECE LEITURA E NÃO É.** `git fetch --force origin main:refs/heads/x`
+sobrescreve a referência local `x` e tira dela os commits que só existiam ali — mesma
+classe de `reset` e `update-ref`, que pedem confirmação. Por isso ele não entra com `*`:
+entram as formas **exatas** (`git fetch`, `git fetch origin`, `--all`, `--prune`,
+`--tags`), onde não existe argumento a mais para escorregar. Buscar uma branch específica
+pergunta, porque é ali que o refspec com dois-pontos caberia.
 
 **Corolário para quem mexer aqui:** toda entrada nova em `allow` que contenha um `*`
 precisa ser lida como *"qualquer coisa que venha depois também está liberada"*. Se existe
@@ -85,6 +92,11 @@ por PR nem por CI.
 
 - Não impede execução arbitrária (a suíte roda código do repositório, e o repositório é
   editável).
+- **Não cobre todo flag que pode vir depois de `git commit -m <mensagem>`** — `--amend`
+  cabe ali. Fica dentro do risco aceito, e a razão é declarada em vez de escondida: ele
+  reescreve o ÚLTIMO commit local, o anterior continua no `reflog`, e nada sai da máquina
+  porque `git push` pergunta. A mensagem precisa do curinga; o resto do subcomando não
+  apaga trabalho.
 - Não impede, por si, escrita em `.claude/` a partir de um comando de shell.
 - Não substitui a permissão do token do GitHub nem a do banco: quem quer que uma operação
   seja **impossível**, e não apenas confirmada, tem de retirá-la da credencial.
