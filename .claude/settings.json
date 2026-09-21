@@ -27,7 +27,6 @@
       "Bash(mkdir *)",
       "Bash(cp *)",
       "Bash(mv *)",
-      "mcp__Supabase__execute_sql",
       "mcp__Supabase__list_tables",
       "mcp__Supabase__list_migrations",
       "mcp__Supabase__list_projects",
@@ -66,7 +65,8 @@
       "Bash(git push --force*)",
       "Bash(git push -f*)",
       "Bash(git reset --hard*)",
-      "Bash(rm -rf *)"
+      "Bash(rm -rf *)",
+      "mcp__Supabase__execute_sql"
     ],
     "deny": [
       "mcp__Supabase__apply_migration",
