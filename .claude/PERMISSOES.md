@@ -71,10 +71,36 @@ Não existe, nesta sintaxe, como escrever *"sort sem `-o` e sem `--compress-prog
 os dois passam a **perguntar**, como `sed`, `awk` e `find` — que saíram por exatamente a
 mesma classe de capacidade.
 
-**O que isso custa, dito para não ser lido como perda de funcionalidade:** ler ordenado
-continua livre (`cat x | sort`, `grep … | sort | uniq -c`), porque a pergunta é sobre o
-comando que ESCREVE. O que passa a pedir confirmação é a forma com arquivo de saída — que é
-a que o parecer apontou.
+**⚠️ E A FRASE QUE ESTAVA AQUI ERA FALSA — achado [P2] do parecer de 23/09.** Ela dizia
+que *"ler ordenado continua livre (`cat x | sort`, `grep … | sort | uniq -c`)"*, e o próprio
+exemplo se contradizia: `uniq -c` casa com `Bash(uniq *)`, que está em `ask`. A regra de
+prefixo **não sabe** separar leitura de escrita — ela vê a linha de comando, não a intenção.
+O custo real é este: **toda** forma de `sort` e `uniq` com argumento passa a pedir
+confirmação, inclusive as de leitura. É um incômodo aceito em troca de fechar a execução e a
+sobrescrita; dizer que só a escrita seria afetada era o documento prometendo o que a sintaxe
+não entrega.
+
+## `git log`, `git diff` e `git show` perderam o curinga — `--output` ESCREVE
+
+**⚠️ ACHADO [P1] DO PARECER DE 23/09, e ele foi REPRODUZIDO antes do conserto:** num
+repositório de teste, `git diff --output=alvo.txt` e `git log --output=alvo.txt`
+**sobrescreveram** um arquivo existente. Sem redirecionamento de shell, sem `cp`, sem
+`Edit` — um argumento. Os três aceitam opções de diff, e com elas o `--output`.
+
+Isso os põe exatamente na classe do `git fetch` deste arquivo: comando que **parece leitura
+e não é**. E a resposta é a mesma, porque é a única que a sintaxe permite — as formas
+**EXATAS** entram em `allow`, o curinga sai. Onde não existe argumento a mais, não existe
+onde `--output` escorregar.
+
+**O que isso custa, dito sem enfeite:** `git log` e `git diff` com argumento fora da lista
+curta passam a pedir confirmação, e é o comando que mais se usa aqui. A lista é curta de
+propósito: ela envelhece (regra 4), e o preço de faltar uma forma é UMA confirmação, não um
+buraco. Alargá-la com curinga seria desfazer o conserto.
+
+**⚠️ E ISTO NÃO FECHA A CLASSE INTEIRA**, pela razão que este arquivo já declara mais
+abaixo: qualquer regra com `*` admite um `> caminho` no fim, e a suíte de testes executa
+código do repositório. O que o conserto tira é o caminho por ARGUMENTO, que é direto e não
+depende de nada disso.
 
 ## `.claude/**` pergunta — e o limite disso está dito
 
@@ -102,6 +128,13 @@ por repositório, branch ou workflow, o controle honesto é a confirmação.
 Isso também **transforma em mecanismo uma regra que já estava escrita**: publicação só
 acontece depois da auditoria e com autorização da direção. Enquanto dependia de eu
 lembrar, era promessa.
+
+**⚠️ E `update_pull_request_branch` VEIO PARA CÁ — achado [P2] do mesmo
+parecer.** Ele incorpora a base ao head REMOTO do PR, quer dizer, escreve no
+repositório de fora — e estava em `allow` enquanto `git merge`, `git push` e
+`push_files` pediam confirmação. Mesma operação, três portas, e uma delas
+aberta: é *"filtro que mora numa porta só não é filtro do sistema"* numa lista
+de permissão.
 
 `pull_request_review_write` vai junto — é por onde uma sessão aprovaria o próprio PR. E
 `create_or_update_file`, `push_files` e `delete_file` escrevem no repositório sem passar
