@@ -52,10 +52,29 @@ interpretadores de uso geral do caminho de uma palavra** e **põe confirmação 
 destrutivo ou sai para fora**. É redução de superfície e de acidente, não prova de
 impossibilidade.
 
-`grep`, `jq`, `cat`, `ls`, `wc`, `sort`, `uniq`, `diff`, `head` e `tail` ficam porque não
-executam programa nenhum. `cp`, `mv`, `rm`, `tee`, `ln`, `dd`, `truncate`, `install`,
+`grep`, `jq`, `cat`, `ls`, `wc`, `diff`, `head` e `tail` ficam porque não executam programa
+nenhum e não escrevem arquivo. `cp`, `mv`, `rm`, `tee`, `ln`, `dd`, `truncate`, `install`,
 `chmod`, `curl` e `wget` perguntam: os primeiros escrevem ou apagam arquivo, os dois
 últimos trazem coisa de fora.
+
+**⚠️ E `sort` E `uniq` SAÍRAM DO `allow` — a frase acima os incluía e era FALSA para os
+dois.** Dois pareceres do Codex, em repositórios diferentes, acharam as duas metades da
+mesma linha: `sort --compress-program=./programa -S 1b entrada-grande.txt` **executa** o
+programa indicado quando o `sort` precisa de arquivo temporário (é a mesma capacidade que
+tirou o `rg --pre` daqui), e `sort -o destino origem` e `uniq origem destino`
+**sobrescrevem** um arquivo que já existe — sem redirecionamento de shell nenhum, que é o
+caminho que `cp` e `tee` já pediam para confirmar.
+
+**E o conserto não é uma regra mais apertada, pela razão que o `git fetch` já ensinou neste
+arquivo:** o perigo mora numa FLAG e num SEGUNDO OPERANDO, e qualquer curinga os admite.
+Não existe, nesta sintaxe, como escrever *"sort sem `-o` e sem `--compress-program`"*. Então
+os dois passam a **perguntar**, como `sed`, `awk` e `find` — que saíram por exatamente a
+mesma classe de capacidade.
+
+**O que isso custa, dito para não ser lido como perda de funcionalidade:** ler ordenado
+continua livre (`cat x | sort`, `grep … | sort | uniq -c`), porque a pergunta é sobre o
+comando que ESCREVE. O que passa a pedir confirmação é a forma com arquivo de saída — que é
+a que o parecer apontou.
 
 ## `.claude/**` pergunta — e o limite disso está dito
 

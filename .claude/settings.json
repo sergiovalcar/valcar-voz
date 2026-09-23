@@ -41,8 +41,6 @@
       "Bash(grep *)",
       "Bash(wc *)",
       "Bash(diff *)",
-      "Bash(sort *)",
-      "Bash(uniq *)",
       "Bash(jq *)",
       "Bash(mkdir *)",
 
@@ -101,6 +99,8 @@
       "Bash(rm *)",
       "Bash(mv *)",
       "Bash(cp *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
       "Bash(rg *)",
       "Bash(sed *)",
       "Bash(awk *)",
