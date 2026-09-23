@@ -55,6 +55,7 @@
       "mcp__Supabase__get_project",
       "mcp__Supabase__get_advisors",
       "mcp__Supabase__query_logs",
+      "mcp__Supabase__execute_sql",
 
       "mcp__github__get_me",
       "mcp__github__list_pull_requests",
@@ -122,7 +123,6 @@
 
       "Edit(.claude/**)",
 
-      "mcp__Supabase__execute_sql",
 
       "mcp__github__merge_pull_request",
       "mcp__github__actions_run_trigger",
