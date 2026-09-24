@@ -76,6 +76,7 @@
       "mcp__github__unsubscribe_pr_activity"
     ],
     "ask": [
+      "Bash(git fetch*)",
       "Bash(git push*)",
       "Bash(git reset*)",
       "Bash(git checkout*)",
@@ -117,8 +118,10 @@
 
       "Edit(.claude/**)",
 
+      "mcp__Supabase__execute_sql",
 
       "mcp__github__merge_pull_request",
+      "mcp__github__update_pull_request_branch",
       "mcp__github__actions_run_trigger",
       "mcp__github__pull_request_review_write",
       "mcp__github__create_or_update_file",

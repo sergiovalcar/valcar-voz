@@ -40,8 +40,15 @@ casos da mesa e falha na classe ao lado — e, pior, o texto aqui **afirmava** a
 que faz o próximo leitor parar de procurar. Mesma forma que a descrição do robô que prometia
 uma trava por tempo de vida quando o código decide por outro fato.
 
-**As cinco saíram.** `git fetch` passou a pedir confirmação, como `reset` e `push`. Custa um
-clique por busca; a alternativa era manter escrita uma promessa que a ferramenta não cumpre.
+**As cinco saíram, e `Bash(git fetch*)` entrou em `ask`.** `git fetch` passou a pedir
+confirmação, como `reset` e `push`. Custa um clique por busca; a alternativa era manter
+escrita uma promessa que a ferramenta não cumpre.
+
+**⚠️ E aqui o curinga é o lado SEGURO, ao contrário do que vale em `allow`.** Cinco formas
+exatas em `ask` seriam lista à mão (regra 4): a sexta forma — `git fetch --force`, a que
+motivou tudo isto — nasceria fora dela. Em `ask` o curinga só pode PEDIR mais confirmação,
+nunca liberar; em `allow` ele libera tudo que vier depois. **A mesma escrita muda de
+natureza conforme a lista em que está.**
 
 **Corolário para quem mexer aqui:** toda entrada nova em `allow` que contenha um `*`
 precisa ser lida como *"qualquer coisa que venha depois também está liberada"*. Se existe
@@ -183,6 +190,35 @@ escape, e trava sem escape faz contornar por fora. Fora do `allow` ele cai no pa
 **⚠️ E ISTO NÃO TORNA A ESCRITA IMPOSSÍVEL** — só deixa de ser automática. Quem quiser que
 ela não exista tem de tirar do TOKEN do banco, não desta lista; é a mesma ressalva que fecha
 este arquivo.
+
+## ⚠️ SAIR DO `allow` NÃO PROVA QUE PERGUNTA — por isso os dois estão escritos em `ask`
+
+**Achado da auditoria independente de 23/09, sobre o conserto anterior deste mesmo arquivo:**
+*"Remover `git fetch`, `execute_sql` e `update_pull_request_branch` de `allow` sem incluí-los
+explicitamente em `ask` não comprova que pedirão confirmação na configuração efetiva."*
+
+Está certo, e a distinção é a de sempre nesta casa: **o que eu tinha era o PADRÃO da
+ferramenta, e padrão não é regra declarada.** Fora das três listas, a operação cai no
+comportamento de fábrica — que hoje pergunta, e que nenhum arquivo deste repositório
+garante amanhã. Pior: uma linha mais larga noutra lista (um `allow` futuro com curinga, uma
+configuração de usuário fora daqui) passaria a cobri-la **sem que nada aqui mudasse**. A
+ausência não se defende sozinha; a entrada explícita se defende.
+
+Por isso `Bash(git fetch*)` e `mcp__Supabase__execute_sql` estão **escritos** em `ask`. O
+efeito hoje é idêntico ao de antes — e é justamente esse o ponto: o conserto não muda o
+comportamento, muda quem responde por ele.
+
+**⚠️ E FOI ESTE CONSERTO QUE ACHOU O TERCEIRO, QUE ERA PIOR: `update_pull_request_branch`
+estava escrito aqui como *"VEIO PARA CÁ"* e NÃO ESTAVA EM `ask` nenhum.** Ele tinha saído do
+`allow`, o texto anunciou a chegada, e a linha nunca foi escrita — **o arquivo afirmando uma
+proteção que a configuração não tinha**, que é exatamente a classe do commit anterior deste
+mesmo arquivo (a guarda do `git fetch` por forma exata). Texto e lista discordando é pior que
+lista curta: quem lê o texto **para de procurar**.
+
+A lição de método é a que se reaproveita: **o achado dizia "os três"; eu tinha conferido os
+dois que me pareciam o pedido.** Foi ao escrever a razão de deixar o terceiro de fora que
+precisei olhá-lo — e ele não estava onde o próprio arquivo dizia. *Antes de justificar uma
+ausência, confira se ela é ausência.*
 
 ## Resumo do que este arquivo NÃO promete
 
