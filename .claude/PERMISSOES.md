@@ -21,12 +21,27 @@ merge-base, blame. `checkout`, `switch`, `restore` e `stash` saíram junto com p
 clean e rebase — `git checkout -f HEAD` descarta alteração não salva e `git stash clear`
 apaga o que estava guardado, e nenhuma regra de prefixo separa essas formas das inofensivas.
 
-**⚠️ `git fetch` PARECE LEITURA E NÃO É.** `git fetch --force origin main:refs/heads/x`
-sobrescreve a referência local `x` e tira dela os commits que só existiam ali — mesma
-classe de `reset` e `update-ref`, que pedem confirmação. Por isso ele não entra com `*`:
-entram as formas **exatas** (`git fetch`, `git fetch origin`, `--all`, `--prune`,
-`--tags`), onde não existe argumento a mais para escorregar. Buscar uma branch específica
-pergunta, porque é ali que o refspec com dois-pontos caberia.
+**⚠️ `git fetch` PARECE LEITURA E NÃO É — E A FORMA EXATA NÃO PROTEGE.** `git fetch --force
+origin main:refs/heads/x` sobrescreve a referência local `x` e tira dela os commits que só
+existiam ali — mesma classe de `reset` e `update-ref`, que pedem confirmação.
+
+Aqui estavam as cinco formas **sem argumento** (`git fetch`, `git fetch origin`, `--all`,
+`--prune`, `--tags`), sob o argumento de que "não existe argumento a mais para escorregar".
+**Era falso, e o achado é da auditoria independente de 23/09:** um `git fetch origin` pelado
+usa os refspecs **configurados** em `remote.origin.fetch`. Com
+`+refs/heads/main:refs/heads/backup` gravado ali, o comando sem argumento nenhum sobrescreve
+a branch local `backup` e leva embora o que só existia nela. **Quem decide o destino é a
+CONFIGURAÇÃO, não a linha de comando** — então nenhuma forma escrita em `allow` consegue
+responder pela operação.
+
+É a guarda que responde a pergunta VIZINHA: ela garante *"não cabe argumento a mais"*, e a
+pergunta que importa é *"isto pode escrever numa referência local?"*. Guarda assim passa nos
+casos da mesa e falha na classe ao lado — e, pior, o texto aqui **afirmava** a proteção, o
+que faz o próximo leitor parar de procurar. Mesma forma que a descrição do robô que prometia
+uma trava por tempo de vida quando o código decide por outro fato.
+
+**As cinco saíram.** `git fetch` passou a pedir confirmação, como `reset` e `push`. Custa um
+clique por busca; a alternativa era manter escrita uma promessa que a ferramenta não cumpre.
 
 **Corolário para quem mexer aqui:** toda entrada nova em `allow` que contenha um `*`
 precisa ser lida como *"qualquer coisa que venha depois também está liberada"*. Se existe
@@ -87,10 +102,16 @@ repositório de teste, `git diff --output=alvo.txt` e `git log --output=alvo.txt
 **sobrescreveram** um arquivo existente. Sem redirecionamento de shell, sem `cp`, sem
 `Edit` — um argumento. Os três aceitam opções de diff, e com elas o `--output`.
 
-Isso os põe exatamente na classe do `git fetch` deste arquivo: comando que **parece leitura
-e não é**. E a resposta é a mesma, porque é a única que a sintaxe permite — as formas
-**EXATAS** entram em `allow`, o curinga sai. Onde não existe argumento a mais, não existe
-onde `--output` escorregar.
+Isso os põe na classe do `git fetch` deste arquivo: comando que **parece leitura e não é**.
+A resposta aqui é a forma **EXATA** em `allow`, com o curinga fora — onde não existe
+argumento a mais, não existe onde `--output` escorregar.
+
+**⚠️ E A DIFERENÇA PARA O `git fetch` É O QUE DECIDE O DESTINO.** Aqui o perigo mora no
+ARGUMENTO, então tirar o argumento fecha o buraco. No `fetch` ele mora na CONFIGURAÇÃO
+(`remote.origin.fetch`), que a linha de comando não mostra — por isso lá nem a forma exata
+serviu, e as cinco saíram para `ask`. **Mesma aparência, causas em lugares diferentes, e por
+isso consertos diferentes:** copiar a resposta de um para o outro é o mapa de colunas
+emprestado que esta casa já pagou.
 
 **O que isso custa, dito sem enfeite:** `git log` e `git diff` com argumento fora da lista
 curta passam a pedir confirmação, e é o comando que mais se usa aqui. A lista é curta de
@@ -139,6 +160,29 @@ de permissão.
 `pull_request_review_write` vai junto — é por onde uma sessão aprovaria o próprio PR. E
 `create_or_update_file`, `push_files` e `delete_file` escrevem no repositório sem passar
 por PR nem por CI.
+
+## `execute_sql` saiu do `allow` — `apply_migration` em `deny` NÃO cobria
+
+**⚠️ ACHADO [P1] DA AUDITORIA INDEPENDENTE DE 23/09, e ele contraria uma decisão da própria
+direção.** `mcp__Supabase__execute_sql` estava em `allow`, quer dizer: pré-autorizado. E a
+ferramenta não distingue consulta de escrita — `UPDATE`, `DELETE` e DDL entram pela mesma
+porta. Ter `apply_migration` em `deny` dava a impressão de que a estrutura estava trancada, e
+**a tranca era de UMA porta**: um `alter table` por `execute_sql` passava sem confirmação
+nenhuma.
+
+O preço não é hipotético e já está escrito nas regras desta casa: *Claude escreve o `.sql`, a
+direção aplica*. Com `execute_sql` pré-autorizado, essa regra dependia só de eu lembrar dela —
+e **regra que depende de alguém lembrar é a classe de defeito que produziu as 62 vendas com o
+supervisor errado**. Um `delete from jobs` teria a mesma cara de uma contagem.
+
+**Ele NÃO foi para `deny`, e a escolha é deliberada.** Medir no banco é metade do trabalho
+desta casa — quase toda regra escrita aqui nasceu de uma consulta. Proibir seria trava sem
+escape, e trava sem escape faz contornar por fora. Fora do `allow` ele cai no padrão:
+**pergunta**. A capacidade fica, a confirmação volta.
+
+**⚠️ E ISTO NÃO TORNA A ESCRITA IMPOSSÍVEL** — só deixa de ser automática. Quem quiser que
+ela não exista tem de tirar do TOKEN do banco, não desta lista; é a mesma ressalva que fecha
+este arquivo.
 
 ## Resumo do que este arquivo NÃO promete
 
