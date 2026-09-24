@@ -44,6 +44,7 @@
       "Bash(jq *)",
       "Bash(mkdir *)",
 
+      "mcp__Supabase__execute_sql",
       "mcp__Supabase__list_tables",
       "mcp__Supabase__list_migrations",
       "mcp__Supabase__list_projects",
@@ -117,8 +118,6 @@
       "Bash(npx *)",
 
       "Edit(.claude/**)",
-
-      "mcp__Supabase__execute_sql",
 
       "mcp__github__merge_pull_request",
       "mcp__github__update_pull_request_branch",

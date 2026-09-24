@@ -220,6 +220,21 @@ dois que me pareciam o pedido.** Foi ao escrever a razão de deixar o terceiro d
 precisei olhá-lo — e ele não estava onde o próprio arquivo dizia. *Antes de justificar uma
 ausência, confira se ela é ausência.*
 
+## `execute_sql` voltou para o `allow` — POR DECISÃO DA DIREÇÃO, inclusive para alterar
+
+**Direção, 24/09:** *"Não quero que peça permissão nem mesmo os que alteram. Já está autorizado
+desde já."* Veio minutos depois de um filtro que liberava só a LEITURA e seguia perguntando nas
+alterações; a direção recusou a metade que perguntava. O filtro foi retirado junto (código que
+não roda é o depósito que a direção não quer), e as duas seções acima ficam como HISTÓRIA do
+porquê a linha já esteve em `ask` — não como regra em vigor.
+
+**O que isto muda, dito uma vez:** um `update`, `delete` ou `alter` por `execute_sql` chega ao
+banco de PRODUÇÃO sem confirmação de ninguém. A proteção que sobra é a de antes de rodar —
+medir, conferir a condição do `where`, preferir escrita condicional —, e a do TOKEN do banco.
+`apply_migration` continua em `deny`: a decisão foi sobre o pedido de permissão, não sobre a
+porta de migração. **Não "consertar" de volta para `ask`** sem nova decisão da direção; o teste
+(`permissoesQueOTextoPromete`) cobra a linha no `allow` justamente para isso.
+
 ## Resumo do que este arquivo NÃO promete
 
 - Não impede execução arbitrária (a suíte roda código do repositório, e o repositório é
