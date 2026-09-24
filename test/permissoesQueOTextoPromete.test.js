@@ -65,11 +65,15 @@ test('a varredura de fato varre — denominador mínimo', () => {
 // ⚠️ O ACHADO DE 23/09 EM UMA LINHA: sair do `allow` é o PADRÃO da ferramenta, não uma regra
 // declarada — e padrão não se defende quando outra lista, fora deste arquivo, passar a
 // cobrir a operação. As três operações que o parecer nomeou entram por ESCRITO.
-test('as três operações que o parecer nomeou pedem confirmação por escrito', () => {
-  for (const n of ['mcp__Supabase__execute_sql', 'mcp__github__update_pull_request_branch']) {
-    assert.ok(permissoes.ask.includes(n), `${n} precisa estar escrito em ask`);
-    assert.ok(!permissoes.allow.includes(n), `${n} não pode voltar para allow`);
-  }
+test('as operações que o parecer nomeou estão escritas — e execute_sql onde a direção mandou', () => {
+  assert.ok(permissoes.ask.includes('mcp__github__update_pull_request_branch'), 'update_pull_request_branch precisa estar escrito em ask');
+  assert.ok(!permissoes.allow.includes('mcp__github__update_pull_request_branch'), 'update_pull_request_branch não pode voltar para allow');
+  // `execute_sql` (direção, 24/09): "Não quero que peça permissão nem mesmo os que alteram.
+  // Já está autorizado desde já." Decisão dela, cobrada aqui para ninguém devolver a linha a
+  // `ask` achando que ficou esquecida. `apply_migration` segue em `deny`.
+  assert.ok(permissoes.allow.includes('mcp__Supabase__execute_sql'), 'execute_sql está em allow por decisão da direção');
+  assert.ok(!permissoes.ask.includes('mcp__Supabase__execute_sql'), 'execute_sql em ask voltaria a pedir permissão');
+  assert.ok(permissoes.deny.includes('mcp__Supabase__apply_migration'), 'apply_migration continua em deny');
   assert.ok(
     permissoes.ask.some((n) => n.startsWith('Bash(git fetch')),
     'git fetch precisa estar escrito em ask',
