@@ -30,11 +30,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      # ⚠️ SEM `cache: npm` E SEM `npm ci`: este repositório NÃO TEM `package-lock.json`, e os
-      # dois exigem o arquivo — a corrida quebraria na primeira linha, por um motivo que não
-      # tem nada a ver com o código enviado. `npm install` é o que funciona com o que existe
-      # hoje; no dia em que o lock entrar, os dois voltam e ficam mais rápidos e mais firmes.
-      - run: npm install
+          cache: npm
+      # ⚠️ `npm ci` E NÃO `npm install` (25/09, parecer do Codex conferido). Sem o lock, cada
+      # corrida resolvia as dependências de novo: uma versão nova de uma dependência indireta
+      # entrava sem commit nenhum, e o CI verde de ontem não dizia nada sobre o de hoje. O lock
+      # entrou no mesmo commit, e `npm ci` recusa correr se ele discordar do package.json.
+      - run: npm ci
       - name: Checagem de sintaxe
         run: npm run check
       - name: Testes
