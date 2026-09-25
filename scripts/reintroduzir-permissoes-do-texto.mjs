@@ -24,10 +24,12 @@ const DEFEITOS = [
     para: '',
   },
   {
-    nome: 'execute_sql volta a ser pré-autorizado',
+    // direção, 24/09: "não quero que peça permissão nem mesmo os que alteram" — o defeito
+    // agora é o contrário: a linha sair do allow e o banco voltar a pedir.
+    nome: 'execute_sql volta a pedir permissão',
     arquivo: '.claude/settings.json',
-    de: '      "mcp__Supabase__execute_sql",\n\n      "mcp__github__merge_pull_request",',
-    para: '      "mcp__github__merge_pull_request",',
+    de: '      "mcp__Supabase__execute_sql",\n      "mcp__Supabase__list_tables",',
+    para: '      "mcp__Supabase__list_tables",',
   },
   {
     nome: 'git fetch sai do ask e volta ao padrão não declarado',
