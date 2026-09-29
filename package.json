@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test test/*.test.js",
-    "check": "node --check server.js && node --check copiloto.js && node --check mulaw.js"
+    "check": "node --check server.js && node --check gravador.js"
   },
   "dependencies": {
     "express": "^4.19.2",
