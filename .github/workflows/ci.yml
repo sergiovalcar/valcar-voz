@@ -1,6 +1,7 @@
 # A ESTEIRA DA VOZ — e por que ela não existia.
 #
-# ⚠️ O REPOSITÓRIO SEMPRE TEVE TESTES (`test/mulaw.test.js`) e sempre teve `npm test`. O que
+# ⚠️ O REPOSITÓRIO SEMPRE TEVE TESTES (`test/mulaw.test.js`, que saiu em 29/09 com o copiloto
+# ao vivo) e sempre teve `npm test`. O que
 # faltava era alguém RODÁ-LOS a cada envio. O preço apareceu do outro lado do sistema, em
 # 21/09: a auditoria independente recusou o PR #10 com *"repositório sem check obrigatório
 # verificado"* — ela não aprova o que não consegue conferir, e estava certa. Teste que existe
